@@ -1,0 +1,152 @@
+--- a/source/native_http_compat.h	2026-10-09 08:21:57.580798234 +0000
++++ b/source/native_http_compat.h	2026-10-09 08:21:57.601269806 +0000
+@@ -54,6 +54,7 @@
+   AsyncWebParameter _tempParam;
+   std::function<void()> _disconnect[4];
+   uint8_t _disconnectCount=0;
++  bool _sendFailed=false;   // set when a synchronous send failed; dispatch() then closes the socket
+ 
+   void parseParams(const char* encoded,bool post);
+   static String urlDecode(const String& in);
+@@ -80,6 +81,10 @@
+   void send(AsyncWebServerResponse* response);
+ 
+   httpd_req_t* nativeRequest() const { return _req; }
++  // Record the outcome of a direct httpd_resp_send(). savedErrno must be errno read
++  // immediately after the failing call. Logs failures always, successes only if logOk.
++  void reportSend(const char* label,esp_err_t err,int savedErrno,uint32_t startMs,size_t bytes,bool logOk=false);
++  bool sendFailed() const { return _sendFailed; }
+ public:
+   void fireDisconnects();
+ };
+--- a/source/native_http_compat.cpp	2026-10-09 08:21:57.583202392 +0000
++++ b/source/native_http_compat.cpp	2026-10-09 08:21:57.601606799 +0000
+@@ -1,6 +1,9 @@
+ #include "native_http_compat.h"
+ #include <cstring>
+ #include <cstdlib>
++#include <errno.h>
++#include <lwip/sockets.h>
++#include <esp_heap_caps.h>
+ 
+ static const char* statusText(int code){
+   switch(code){
+@@ -173,6 +176,18 @@
+   _disconnectCount=0;
+ }
+ 
++void AsyncWebServerRequest::reportSend(const char* label,esp_err_t err,int savedErrno,uint32_t startMs,size_t bytes,bool logOk){
++  if(err!=ESP_OK) _sendFailed=true;
++  if(err==ESP_OK && !logOk) return;
++  int soErr=0; socklen_t soLen=sizeof(soErr);
++  const int fd=_req ? httpd_req_to_sockfd(_req) : -1;
++  if(err!=ESP_OK && fd>=0) getsockopt(fd,SOL_SOCKET,SO_ERROR,&soErr,&soLen);   // best effort; clears pending error
++  Serial.printf("[HTTP] send %s %s err=%d(0x%04x) errno=%d so_error=%d ms=%lu bytes=%u heap=%u largest=%u\n",
++                label?label:"?", err==ESP_OK?"ok":"FAILED", (int)err, (unsigned)err,
++                err==ESP_OK?0:savedErrno, soErr, (unsigned long)(millis()-startMs), (unsigned)bytes,
++                (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
++}
++
+ void AsyncWebServerRequest::send(int code,const char* contentType,const char* content){
+   AsyncWebServerResponse* r=beginResponse(code,contentType,content);
+   send(r);
+@@ -227,7 +242,7 @@
+   if(response->_chunked){
+     httpd_req_t* asyncReq=nullptr;
+     if(httpd_req_async_handler_begin(_req,&asyncReq)!=ESP_OK){
+-      delete response; return;
++      delete response; _sendFailed=true; return;   // nothing sent: close instead of leaving client hanging
+     }
+     auto* ctx=new ChunkWorkerCtx();
+     ctx->req=asyncReq; ctx->response=response;
+@@ -244,10 +259,14 @@
+   }
+ 
+   if(!applyHeaders(_req,response)){
++    Serial.printf("[HTTP] send headers FAILED (nothing sent) code=%d heap=%u\n",response->_code,(unsigned)ESP.getFreeHeap());
+     delete response;
++    _sendFailed=true;   // no bytes were sent; closing is the only way the client learns of the failure
+     fireDisconnects();
+     return;
+   }
++  const uint32_t t0=millis();
++  const size_t nbytes=response->_data ? response->_dataLen : response->_body.length();
+ 
+   esp_err_t err;
+   if(response->_data){
+@@ -255,7 +274,8 @@
+   }else{
+     err=httpd_resp_send(_req,response->_body.c_str(),(ssize_t)response->_body.length());
+   }
+-  (void)err;
++  const int savedErrno=errno;
++  reportSend("resp",err,savedErrno,t0,nbytes,false);
+   delete response;
+   fireDisconnects();
+ }
+@@ -273,6 +293,9 @@
+   if(route->handler){
+     AsyncWebServerRequest request(req);
+     route->handler(&request);
++    // A failed or never-started response must not leave a keep-alive socket open with a
++    // truncated body; returning ESP_FAIL makes esp_http_server close this session.
++    if(request.sendFailed()) return ESP_FAIL;
+   }
+   return ESP_OK;
+ }
+--- a/source/dashboard.cpp	2026-10-09 08:21:57.585972255 +0000
++++ b/source/dashboard.cpp	2026-10-09 08:21:57.602017048 +0000
+@@ -4,6 +4,8 @@
+ #include "logo_data.h"
+ #include <esp_system.h>
+ #include <mbedtls/sha256.h>
++#include <errno.h>
++#include <esp_heap_caps.h>
+ 
+ bool accountExists() {
+   String user, record;
+@@ -287,9 +289,10 @@
+   httpd_req_t* req = request->nativeRequest();
+   httpd_resp_set_type(req, contentType);
+   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
++  const uint32_t t0 = millis();
+   esp_err_t err = httpd_resp_send(req, (const char*)page, (ssize_t)length);
+-  Serial.printf("[HTTP] %s native static bytes=%u err=%d heap=%u\n",
+-                label, (unsigned)length, (int)err, (unsigned)ESP.getFreeHeap());
++  const int savedErrno = errno;
++  request->reportSend(label, err, savedErrno, t0, length, true);
+ }
+ 
+ static void sendSmallProgmemPage(AsyncWebServerRequest* request,
+@@ -335,24 +338,19 @@
+       return;
+     }
+ 
+-    AsyncWebServerResponse* response = beginProgmemResponse(
+-        200, "text/html; charset=UTF-8", DASHBOARD_GZIP, DASHBOARD_GZIP_LEN);
+-    if (!response) {
+-      Serial.println("[HTTP] ERROR: dashboard gzip response allocation failed");
+-      request->send(500, "text/plain", "Dashboard response allocation failed");
+-      return;
+-    }
+-    (void)response;
+-    request->nativeRequest();
++    // The AsyncProgmemResponse formerly allocated here was never transmitted (the native
++    // path below bypasses it) and is removed. Exactly one httpd_resp_send() is issued.
+     httpd_req_t* req = request->nativeRequest();
++    Serial.printf("[HTTP] dashboard auth-ok heap=%u largest=%u\n", (unsigned)ESP.getFreeHeap(),
++                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+     httpd_resp_set_type(req, "text/html; charset=UTF-8");
+     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+     httpd_resp_set_hdr(req, "Content-Disposition", "inline");
++    const uint32_t t0 = millis();
+     esp_err_t err = httpd_resp_send(req, (const char*)DASHBOARD_GZIP, (ssize_t)DASHBOARD_GZIP_LEN);
+-    Serial.printf("[HTTP] dashboard gzip native bytes=%u err=%d heap=%u\n",
+-                  (unsigned)DASHBOARD_GZIP_LEN, (int)err, (unsigned)ESP.getFreeHeap());
+-    delete response;
++    const int savedErrno = errno;
++    request->reportSend("dashboard-gzip", err, savedErrno, t0, DASHBOARD_GZIP_LEN, true);
+   });
+ 
+   server.on("/health", HTTP_GET, [](AsyncWebServerRequest* request){
