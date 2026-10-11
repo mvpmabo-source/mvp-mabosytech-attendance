@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Settings, Key, Plus, Trash2, Shield, FileClock, Copy, Check } from "lucide-react";
+import { Settings, Key, Plus, Trash2, Shield, FileClock, Copy, Check, RotateCw } from "lucide-react";
 import { supabase, type Device, type AuditLogEntry } from "@/lib/supabase";
 import { Card, LoadingSpinner, EmptyState, ErrorState, Badge, timeAgo } from "@/components/ui";
 import { useAuth } from "@/context/AuthContext";
@@ -27,6 +27,7 @@ export function SettingsPage() {
   const [newDeviceId, setNewDeviceId] = useState("");
   const [newDeviceName, setNewDeviceName] = useState("");
   const [generatedKey, setGeneratedKey] = useState<string | null>(null);
+  const [generatedDeviceId, setGeneratedDeviceId] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -55,8 +56,38 @@ export function SettingsPage() {
       const { error: insertErr } = await supabase.from("devices").insert({ device_id: deviceId, api_key_hash: apiKeyHash, name: newDeviceName.trim() || deviceId });
       if (insertErr) throw new Error(insertErr.message);
       await supabase.from("audit_log").insert({ user_id: user?.id, action: "device_registered", target: deviceId, details: { name: newDeviceName.trim() } });
-      setGeneratedKey(apiKey); setNewDeviceId(""); setNewDeviceName(""); setShowAddDevice(false); await load();
+      setGeneratedDeviceId(deviceId); setGeneratedKey(apiKey); setNewDeviceId(""); setNewDeviceName(""); setShowAddDevice(false); await load();
     } catch (err) { setError(err instanceof Error ? err.message : "Failed to add device"); } finally { setBusy(false); }
+  };
+
+  // Rotate the stored hash and show the new raw key once. This repairs a
+  // lost/mismatched device key without deleting the device or its attendance data.
+  const handleRotateKey = async (deviceId: string) => {
+    if (!confirm(`Rotate the API key for "${deviceId}"? The ESP32 will need the new key flashed before cloud sync resumes.`)) return;
+    setBusy(true); setError(null); setGeneratedKey(null); setGeneratedDeviceId(null);
+    try {
+      const apiKey = generateApiKey();
+      const apiKeyHash = await sha256Hex(apiKey);
+      const { error: updateErr } = await supabase
+        .from("devices")
+        .update({ api_key_hash: apiKeyHash, updated_at: new Date().toISOString() })
+        .eq("device_id", deviceId);
+      if (updateErr) throw new Error(updateErr.message);
+      const { error: auditErr } = await supabase.from("audit_log").insert({
+        user_id: user?.id,
+        action: "device_api_key_rotated",
+        target: deviceId,
+        details: { reason: "manual_rotation" },
+      });
+      if (auditErr) throw new Error(auditErr.message);
+      setGeneratedDeviceId(deviceId);
+      setGeneratedKey(apiKey);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to rotate device API key");
+    } finally {
+      setBusy(false);
+    }
   };
 
   const handleDeleteDevice = async (deviceId: string) => {
@@ -82,9 +113,10 @@ export function SettingsPage() {
             <Shield className="w-5 h-5 text-teal-600 flex-shrink-0 mt-0.5" />
             <div className="flex-1 min-w-0">
               <h3 className="text-sm font-semibold text-teal-800">Device API Key Generated</h3>
+              {generatedDeviceId && <p className="text-xs text-teal-800 mt-1">Device ID: <code className="font-mono">{generatedDeviceId}</code></p>}
               <p className="text-xs text-teal-700 mt-1 mb-3">Copy this key now. It cannot be recovered later — only its hash is stored. Put it in your firmware's <code className="font-mono bg-teal-100 px-1 rounded">secrets_local.h</code> as <code className="font-mono bg-teal-100 px-1 rounded">CLOUD_API_KEY</code>.</p>
               <div className="flex items-center gap-2"><code className="flex-1 min-w-0 px-3 py-2 bg-white rounded-lg text-xs font-mono text-slate-700 overflow-x-auto border border-teal-200">{generatedKey}</code><button onClick={copyKey} className="flex items-center gap-1 px-3 py-2 text-sm font-medium rounded-lg bg-teal-600 text-white hover:bg-teal-700 transition-colors flex-shrink-0">{copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}{copied ? "Copied" : "Copy"}</button></div>
-              <button onClick={() => setGeneratedKey(null)} className="mt-3 text-xs text-teal-700 hover:text-teal-900 font-medium">Dismiss</button>
+              <button onClick={() => { setGeneratedKey(null); setGeneratedDeviceId(null); }} className="mt-3 text-xs text-teal-700 hover:text-teal-900 font-medium">Dismiss</button>
             </div>
           </div>
         </Card>
@@ -102,7 +134,10 @@ export function SettingsPage() {
           <div className="space-y-2">{devices.map((d) => (
             <div key={d.id} className="flex items-center justify-between p-3 rounded-lg border border-slate-200 hover:bg-slate-50 transition-colors">
               <div className="min-w-0"><div className="flex items-center gap-2"><p className="font-medium text-slate-700 text-sm">{d.name}</p>{d.last_seen_at && <Badge className="bg-emerald-50 text-emerald-700 border-emerald-200">Active {timeAgo(d.last_seen_at)}</Badge>}</div><p className="text-xs text-slate-400 font-mono mt-0.5">{d.device_id}</p>{d.firmware_version && <p className="text-xs text-slate-400 mt-0.5">{d.firmware_version}</p>}</div>
-              <button onClick={() => handleDeleteDevice(d.device_id)} className="p-2 text-slate-400 hover:text-rose-500 hover:bg-rose-50 rounded-lg transition-colors"><Trash2 className="w-4 h-4" /></button>
+              <div className="flex items-center gap-1 flex-shrink-0">
+                <button onClick={() => handleRotateKey(d.device_id)} disabled={busy} title="Rotate device API key" aria-label={`Rotate API key for ${d.device_id}`} className="p-2 text-slate-400 hover:text-teal-600 hover:bg-teal-50 rounded-lg transition-colors disabled:opacity-50"><RotateCw className="w-4 h-4" /></button>
+                <button onClick={() => handleDeleteDevice(d.device_id)} disabled={busy} title="Remove device" aria-label={`Remove device ${d.device_id}`} className="p-2 text-slate-400 hover:text-rose-500 hover:bg-rose-50 rounded-lg transition-colors disabled:opacity-50"><Trash2 className="w-4 h-4" /></button>
+              </div>
             </div>
           ))}</div>
         )}
