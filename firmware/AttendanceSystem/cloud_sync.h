@@ -23,6 +23,8 @@
  */
 #include <Arduino.h>
 #include <WiFiClientSecure.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "config.h"
 
 extern SemaphoreHandle_t cloudSdMutex;
