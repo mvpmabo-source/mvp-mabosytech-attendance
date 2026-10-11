@@ -89,21 +89,15 @@ void CloudSyncClass::enqueueAttendance(
   item.nextAttempt = 0;
   item.uploaded = false;
 
-  // Persist first. If SD is absent or the write fails, do not enqueue an
-  // in-memory-only event that could be lost on reboot.
-  if (!sdAvailable || !persistOutboxItem(item)) {
-    Serial.println("[CLOUD] Event not queued: durable SD outbox write failed; retry will occur on next attendance event.");
-    return;
-  }
-  item.persisted = true;
-
+  // Keep the event in RAM even if the SD lock is busy or the card is absent.
+  // processOutbox() retries persistence and never uploads an unpersisted event.
+  item.persisted = sdAvailable && persistOutboxItem(item);
   if (_outboxCount < CLOUD_OUTBOX_MAX) {
-    _outbox[_outboxCount] = item;
-    _outboxCount++;
+    _outbox[_outboxCount++] = item;
+  } else if (item.persisted) {
+    Serial.println("[CLOUD] RAM outbox full; event remains durable on SD for later recovery.");
   } else {
-    // RAM outbox is full but the item is safely on SD.
-    // It will be loaded on the next outbox drain cycle via loadOutboxFromSD().
-    Serial.println("[CLOUD] RAM outbox full; event persisted to SD, will drain later.");
+    Serial.println("[CLOUD] CRITICAL: RAM outbox full and SD persistence failed; cloud copy could not be queued.");
   }
 
   Serial.printf("[CLOUD] Enqueued event uid=%s fp=%d type=%s\n", item.eventUid, fingerprintId, eventType);
@@ -212,13 +206,14 @@ bool CloudSyncClass::recoverOutboxFiles() {
   // A live file wins; never replace it with an unverified temporary candidate.
   if (!SD.exists(CLOUD_OUTBOX_FILE)) {
     if (SD.exists(CLOUD_OUTBOX_TMP_FILE) && SD.rename(CLOUD_OUTBOX_TMP_FILE, CLOUD_OUTBOX_FILE)) {
-      Serial.println("[CLOUD] Recovered outbox from verified-temp candidate.");
+      Serial.println("[CLOUD] Recovered outbox from temp candidate.");
     } else if (SD.exists(CLOUD_OUTBOX_BACKUP_FILE) && SD.rename(CLOUD_OUTBOX_BACKUP_FILE, CLOUD_OUTBOX_FILE)) {
       Serial.println("[CLOUD] Recovered outbox from backup.");
     }
   }
+  const bool exists = SD.exists(CLOUD_OUTBOX_FILE);
   unlockCloudSd();
-  return SD.exists(CLOUD_OUTBOX_FILE);
+  return exists;
 }
 
 bool CloudSyncClass::loadOutboxFromSD() {
@@ -441,6 +436,10 @@ void CloudSyncClass::processOutbox() {
 
   for (int i = 0; i < _outboxCount; i++) {
     if (_outbox[i].uploaded) continue;
+    if (!_outbox[i].persisted) {
+      if (sdAvailable && persistOutboxItem(_outbox[i])) _outbox[i].persisted = true;
+      else continue;
+    }
     if (_outbox[i].retryCount >= CLOUD_MAX_RETRIES) {
       Serial.printf("[CLOUD] Event %s exceeded max retries (%d); keeping on SD.\n",
                     _outbox[i].eventUid, _outbox[i].retryCount);
