@@ -9,8 +9,8 @@
 #define OTA_PASSWORD "REPLACE_WITH_A_UNIQUE_RANDOM_OTA_PASSWORD"
 
 // Bolt-managed cloud backend; replace placeholders with values from the active Bolt project.
-#define CLOUD_BASE_URL "PASTE_EXACT_BOLT_DEVICE_INGEST_FUNCTION_URL_HERE"
-#define CLOUD_PUBLIC_API_KEY "PASTE_BOLT_PUBLIC_ANON_KEY_HERE"
+#define CLOUD_BASE_URL "https://mfzskhrwepiyqzwrzeow.supabase.co/functions/v1/device-ingest"
+#define CLOUD_PUBLIC_API_KEY ""
 
 // ---- Cloud Sync (NEW — for hosted dashboard) ----
 // The device ID must match what you registered in the cloud dashboard's
