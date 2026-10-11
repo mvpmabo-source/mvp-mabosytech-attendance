@@ -46,14 +46,11 @@ void setup() {
   // without making the SD task wait for every network write.
   lessonAppendQueue= xQueueCreate(8,  sizeof(LessonAppend));
   systemLogQueue   = xQueueCreate(32, sizeof(SystemLogEvent));
-  // The HTTP task only submits the newest browser epoch here; all RTC/I2C
-  // and Preferences writes are performed by loop() via serviceBrowserTimeSync().
-  browserTimeSyncQueue = xQueueCreate(1, sizeof(uint32_t));
+  // The legacy browser-time-sync queue is unused in cloud-only mode.
 
   prefs.begin("fps_db", false);
   loadAttendanceJournal();
   loadPresenceState();
-  loadAuthAccount();
   // OTA authentication uses its dedicated OTA_PASSWORD. It is independent
   // of the dashboard account's salted password record.
   setupOTA();
@@ -78,30 +75,18 @@ void setup() {
   ensureLessonsCsv();
   ensureSystemLog();
 
-  // Use the exact AsyncWebServer construction pattern proven by the
-  // standalone Async HTTP isolation test: one global AsyncWebServer object,
-  // no custom AsyncTCP stack/core overrides, and server.begin() after AP +
-  // setup-time SD mount are ready.
-  Serial.printf("[WIFI] before HTTP routes: connected=%s ip=%s freeHeap=%u\n",
-                wifiDashboardReady() ? "YES" : "NO",
-                wifiDashboardReady() ? WiFi.localIP().toString().c_str() : "0.0.0.0",
-                (unsigned)ESP.getFreeHeap());
-
+  // CLOUD-ONLY MODE:
+  // Do not start the legacy local HTTP dashboard/API. Its HTTPD task, route
+  // handlers, SD stream queues and JSON bootstrap caches consume fragmented
+  // heap needed by mbedTLS certificate parsing and HTTPS cloud sync.
+  // Enrollment, restart and time sync are handled by authenticated cloud commands.
   dashboardBootReady = false;
   attendanceBootReady = false;
-  initFastStatusCache();
-  initBootSnapshotCache();
-  initSdHttpBridge();
-  setupDashboardRoutes();
-  xTaskCreatePinnedToCore(sdTaskFunc,  "sdTask",  6144, nullptr, 1, &sdTaskHandle,  1);
-  Serial.printf("[WIFI] after full network setup: connected=%s ip=%s freeHeap=%u\n",
-                wifiDashboardReady() ? "YES" : "NO",
-                wifiDashboardReady() ? WiFi.localIP().toString().c_str() : "0.0.0.0",
-                (unsigned)ESP.getFreeHeap());
+  Serial.printf("[MEM] Cloud-only mode: local dashboard disabled; freeHeap=%u maxAlloc=%u\n",
+                (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+  xTaskCreatePinnedToCore(sdTaskFunc, "sdTask", 6144, nullptr, 1, &sdTaskHandle, 1);
 
-  // Migration, boot-history loading, and all subsequent filesystem I/O are
-  // owned by sdTask. The initial mount was already completed above, before
-  // HTTP allocations, to preserve the legacy card-detection behavior.
+  // SD history/migration and subsequent filesystem I/O remain owned by sdTask.
 
   fingerSerial.begin(57600, SERIAL_8N2, FINGER_RX, FINGER_TX);
   finger.begin(57600);
@@ -150,6 +135,7 @@ void setup() {
   if (fingerprintSensorOk) fpSetLed(true);
 
   CloudSync.begin(CLOUD_DEVICE_ID, CLOUD_API_KEY);
+  CloudSync.onCommand(handleCloudCommand);
   if (CloudSync.isEnabled())
     addLog("INFO", -1, "Cloud sync enabled");
   else
@@ -162,7 +148,7 @@ void setup() {
                 wifiDashboardReady() ? "YES" : "NO",
                 wifiDashboardReady() ? WiFi.localIP().toString().c_str() : "0.0.0.0",
                 (unsigned)ESP.getFreeHeap());
-  Serial.println("[BOOT] AsyncWebServer active; SD task running.");
+  Serial.println("[BOOT] Cloud-only mode active; local HTTP dashboard disabled; SD task running.");
 }
 
 // =====================================================
@@ -182,14 +168,11 @@ void loop() {
 
   // Keep Wire/DS3231 and Preferences out of AsyncTCP callbacks. The network
   // callback only enqueues the browser epoch; loop() owns the actual write.
-  serviceBrowserTimeSync();
   serviceDeviceSetupPersistence();
-  serviceFastStatusCache();
 
   serviceLedBuzzerTimers();
   serviceWeekendAttendanceFeedback();
   serviceOledKeepAlive();
-  serviceBootSnapshotRefresh();
   bool applyFingerprintSecurity = false;
   if (lockState(20)) {
     applyFingerprintSecurity = fingerprintSecurityDirty && fingerprintSensorOk && !isEnrolling;
