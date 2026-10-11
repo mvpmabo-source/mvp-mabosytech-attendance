@@ -35,4 +35,4 @@ jobs:
         working-directory: firmware/AttendanceSystem
         run: cp secrets.example.h secrets_local.h
       - name: Compile ESP32 firmware
-        run: arduino-cli compile --fqbn esp32:esp32:esp32 --warnings all firmware/AttendanceSystem
+        run: arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs --warnings all firmware/AttendanceSystem
