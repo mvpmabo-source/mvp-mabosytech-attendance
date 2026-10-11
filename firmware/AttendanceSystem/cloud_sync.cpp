@@ -561,7 +561,7 @@ void CloudSyncClass::processOutbox() {
       Serial.println("[CLOUD] HTTP 200 but server did not confirm; applying backoff.");
       for (int j = 0; j < eligibleCount; j++) {
         _outbox[eligibleIdx[j]].retryCount++;
-        uint32_t backoff = 1000UL << min(_outbox[eligibleIdx[j]].retryCount, 12);
+        uint32_t backoff = 1000UL << min((int)_outbox[eligibleIdx[j]].retryCount, 12);
         _outbox[eligibleIdx[j]].nextAttempt = millis() + backoff;
       }
       compactOutboxFile();
@@ -571,7 +571,7 @@ void CloudSyncClass::processOutbox() {
     Serial.printf("[CLOUD] Upload failed (HTTP %d); events retained with backoff.\n", httpStatus);
     for (int j = 0; j < eligibleCount; j++) {
       _outbox[eligibleIdx[j]].retryCount++;
-      uint32_t backoff = 1000UL << min(_outbox[eligibleIdx[j]].retryCount, 12);
+      uint32_t backoff = 1000UL << min((int)_outbox[eligibleIdx[j]].retryCount, 12);
       _outbox[eligibleIdx[j]].nextAttempt = millis() + backoff;
     }
     // Persist updated retry counts to SD
