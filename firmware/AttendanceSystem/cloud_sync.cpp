@@ -29,6 +29,12 @@ CloudSyncClass CloudSync;
 void CloudSyncClass::begin(const char* deviceId, const char* apiKey) {
   if (!deviceId || !*deviceId || !apiKey || !*apiKey) {
     _enabled = false;
+    Serial.println("[CLOUD] Disabled: CLOUD_DEVICE_ID or CLOUD_API_KEY is missing.");
+    return;
+  }
+  if (strncmp(CLOUD_BASE_URL, "https://", 8) != 0) {
+    _enabled = false;
+    Serial.println("[CLOUD] Disabled: set the exact Bolt device-ingest Server Function URL in secrets_local.h.");
     return;
   }
   strncpy(_deviceId, deviceId, sizeof(_deviceId) - 1);
@@ -626,12 +632,17 @@ bool CloudSyncClass::postJson(const String& body, String* responseOut, int* http
     "POST %s HTTP/1.1\r\n"
     "Host: %s\r\n"
     "Content-Type: application/json\r\n"
-    "Content-Length: %d\r\n"
-    "Connection: close\r\n"
-    "\r\n"
-    "%s",
-    path.c_str(), host.c_str(), (int)body.length(), body.c_str()
+    "Content-Length: %d\r\n",
+    path.c_str(), host.c_str(), (int)body.length()
   );
+  // Optional public/anon key for the managed function gateway. The device
+  // API key remains in the JSON body and is validated server-side.
+  if (CLOUD_PUBLIC_API_KEY[0] != '\\0') {
+    _tls.printf("apikey: %s\\r\\nAuthorization: Bearer %s\\r\\n",
+                CLOUD_PUBLIC_API_KEY, CLOUD_PUBLIC_API_KEY);
+  }
+  _tls.print("Connection: close\\r\\n\\r\\n");
+  _tls.print(body);
 
   // Read the HTTP response status line
   bool ok = false;
@@ -675,15 +686,15 @@ bool CloudSyncClass::postJson(const String& body, String* responseOut, int* http
 
   if (httpStatusOut) *httpStatusOut = httpStatus;
 
-  // Only return success on HTTP 200
+  // Keep the response body available for diagnosing HTTP 401/403/404 errors.
+  if (responseOut) *responseOut = responseBody;
   if (!ok) {
-    Serial.printf("[CLOUD] HTTP status %d (not 200)\n", httpStatus);
+    String preview = responseBody;
+    preview.replace("\\r", " "); preview.replace("\\n", " ");
+    if (preview.length() > 180) preview.remove(180);
+    Serial.printf("[CLOUD] HTTP status %d (not 200); response=%s\\n",
+                  httpStatus, preview.length() ? preview.c_str() : "(empty)");
     return false;
-  }
-
-  // Parse response body if requested
-  if (responseOut) {
-    *responseOut = responseBody;
   }
 
   return true;
