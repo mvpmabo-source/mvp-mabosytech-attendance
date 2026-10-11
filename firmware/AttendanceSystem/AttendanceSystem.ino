@@ -39,6 +39,7 @@ void setup() {
   ramLogSnapshotMutex = xSemaphoreCreateMutex();
   rtcMutex            = xSemaphoreCreateMutex();
   authSessionMutex    = xSemaphoreCreateMutex();
+  cloudSdMutex        = xSemaphoreCreateMutex();
   attendanceQueue  = xQueueCreate(16, sizeof(AttendanceEvent));
   sdRequestQueue   = xQueueCreate(2,  sizeof(SdBulkRequest));
   // Reply buffering gives the async HTTP bridge room to absorb SD output
