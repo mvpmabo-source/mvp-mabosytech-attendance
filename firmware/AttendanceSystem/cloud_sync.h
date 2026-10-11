@@ -56,19 +56,19 @@ inline void unlockCloudSd() {
 struct CloudOutboxItem {
   // event_uid is derived from device ID + date + time + fingerprint ID,
   // so do not store a second copy of it in every RAM record.
-  char date[12];        // YYYY-MM-DD
-  char timeStr[10];     // HH:MM:SS
-  int  fingerprintId;
+  char date[11];        // YYYY-MM-DD + NUL
+  char timeStr[9];      // HH:MM:SS + NUL
+  uint8_t fingerprintId; // fingerprint ID range is 1..200
   char name[32];
   char collegeId[24];
   char role[16];
   char department[24];
   char eventType[10];   // CHECK_IN / CHECK_OUT, including NUL
-  char status[12];      // LEFT_EARLY fits including NUL
+  char status[11];      // longest value LEFT_EARLY + NUL
   uint8_t retryCount;
   uint32_t nextAttempt;  // millis() target for next attempt (0 = immediate)
-  bool  uploaded;        // marker: server confirmed acceptance
-  bool  persisted;       // true only after durable SD outbox write/recovery
+  bool  uploaded : 1;    // marker: server confirmed acceptance
+  bool  persisted : 1;   // true only after durable SD outbox write/recovery
 };
 
 struct CloudPendingCommand {
