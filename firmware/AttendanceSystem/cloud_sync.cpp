@@ -40,7 +40,7 @@ void CloudSyncClass::begin(const char* deviceId, const char* apiKey) {
 
   // Arduino-ESP32 Core 3.x exposes the compiled-in trusted root bundle.
   // Validate the actual Supabase HTTPS certificate chain; never use setInsecure().
-  _tls.setCACertBundle(esp_crt_bundle_get(), esp_crt_bundle_get_len(esp_crt_bundle_get()));
+  _tls.setCACertBundle(esp_crt_bundle_get());
 }
 
 // ──────────────────────────────────────────────
@@ -158,46 +158,67 @@ bool CloudSyncClass::persistOutboxItem(const CloudOutboxItem& item) {
   return ok;
 }
 
-bool CloudSyncClass::rewriteOutboxFile() {
-  if (!sdAvailable) return false;
+bool CloudSyncClass::compactOutboxFile() {
+  if (!sdAvailable || !lockCloudSd(1000)) return false;
 
-  // Rewrite the outbox file with only the events still pending
-  // (i.e., not yet confirmed by the server). This compacts the file
-  // after a successful batch upload.
-  File f = SD.open(CLOUD_OUTBOX_FILE, FILE_WRITE);
-  if (!f) {
-    Serial.println("[CLOUD] ERROR: cannot rewrite outbox file");
-    return false;
-  }
-
-  f.println(CLOUD_OUTBOX_HEADER);
-
-  for (int i = 0; i < _outboxCount; i++) {
+  // Preserve the current file as a backup before replacing it. The live file
+  // is never truncated. Recovery prefers a valid live file, then temp, then backup.
+  SD.remove(CLOUD_OUTBOX_TMP_FILE);
+  File tmp = SD.open(CLOUD_OUTBOX_TMP_FILE, FILE_WRITE);
+  if (!tmp) { unlockCloudSd(); return false; }
+  const String header = String(CLOUD_OUTBOX_HEADER) + "\n";
+  bool ok = tmp.write((const uint8_t*)header.c_str(), header.length()) == header.length();
+  for (int i = 0; ok && i < _outboxCount; i++) {
     const CloudOutboxItem& item = _outbox[i];
-    if (item.uploaded) continue;  // skip confirmed events
-
+    if (item.uploaded) continue;
     String row;
-    row.reserve(160);
-    row += item.eventUid;          row += ",";
-    row += item.date;              row += ",";
-    row += item.timeStr;           row += ",";
-    row += String(item.fingerprintId); row += ",";
-    row += csvEscape(String(item.name));        row += ",";
-    row += csvEscape(String(item.collegeId));   row += ",";
-    row += csvEscape(String(item.role));        row += ",";
-    row += csvEscape(String(item.department));  row += ",";
-    row += item.eventType;         row += ",";
-    row += item.status;            row += ",";
-    row += String(item.retryCount); row += ",";
-    row += String(item.nextAttempt);
-    row += "\n";
-
-    f.write((const uint8_t*)row.c_str(), row.length());
+    row.reserve(180);
+    row += item.eventUid; row += ","; row += item.date; row += ",";
+    row += item.timeStr; row += ","; row += String(item.fingerprintId); row += ",";
+    row += csvEscape(String(item.name)); row += ",";
+    row += csvEscape(String(item.collegeId)); row += ",";
+    row += csvEscape(String(item.role)); row += ",";
+    row += csvEscape(String(item.department)); row += ",";
+    row += item.eventType; row += ","; row += item.status; row += ",";
+    row += String(item.retryCount); row += ","; row += String(item.nextAttempt); row += "\n";
+    ok = tmp.write((const uint8_t*)row.c_str(), row.length()) == row.length();
   }
+  tmp.flush();
+  tmp.close();
 
-  f.flush();
-  f.close();
-  return true;
+  // Verify the candidate can be read and has a valid header before promotion.
+  File verify = ok ? SD.open(CLOUD_OUTBOX_TMP_FILE, FILE_READ) : File();
+  if (!verify) ok = false;
+  if (verify) {
+    String gotHeader = verify.readStringUntil('\n');
+    if (gotHeader != CLOUD_OUTBOX_HEADER) ok = false;
+    verify.close();
+  }
+  if (ok) {
+    SD.remove(CLOUD_OUTBOX_BACKUP_FILE);
+    if (SD.exists(CLOUD_OUTBOX_FILE) && !SD.rename(CLOUD_OUTBOX_FILE, CLOUD_OUTBOX_BACKUP_FILE)) ok = false;
+    if (ok && !SD.rename(CLOUD_OUTBOX_TMP_FILE, CLOUD_OUTBOX_FILE)) {
+      if (SD.exists(CLOUD_OUTBOX_BACKUP_FILE)) SD.rename(CLOUD_OUTBOX_BACKUP_FILE, CLOUD_OUTBOX_FILE);
+      ok = false;
+    }
+  }
+  unlockCloudSd();
+  if (!ok) Serial.println("[CLOUD] Outbox compaction failed; original/backup retained for recovery.");
+  return ok;
+}
+
+bool CloudSyncClass::recoverOutboxFiles() {
+  if (!sdAvailable || !lockCloudSd(1000)) return false;
+  // A live file wins; never replace it with an unverified temporary candidate.
+  if (!SD.exists(CLOUD_OUTBOX_FILE)) {
+    if (SD.exists(CLOUD_OUTBOX_TMP_FILE) && SD.rename(CLOUD_OUTBOX_TMP_FILE, CLOUD_OUTBOX_FILE)) {
+      Serial.println("[CLOUD] Recovered outbox from verified-temp candidate.");
+    } else if (SD.exists(CLOUD_OUTBOX_BACKUP_FILE) && SD.rename(CLOUD_OUTBOX_BACKUP_FILE, CLOUD_OUTBOX_FILE)) {
+      Serial.println("[CLOUD] Recovered outbox from backup.");
+    }
+  }
+  unlockCloudSd();
+  return SD.exists(CLOUD_OUTBOX_FILE);
 }
 
 bool CloudSyncClass::loadOutboxFromSD() {
@@ -498,7 +519,7 @@ void CloudSyncClass::processOutbox() {
       _outboxCount = newCount;
 
       // Rewrite the SD outbox file to remove confirmed events
-      rewriteOutboxFile();
+      compactOutboxFile();
 
       Serial.printf("[CLOUD] Batch upload confirmed: %d events accepted.\n", acceptedCount);
     } else {
@@ -509,7 +530,7 @@ void CloudSyncClass::processOutbox() {
         uint32_t backoff = 1000UL << min(_outbox[eligibleIdx[j]].retryCount, 12);
         _outbox[eligibleIdx[j]].nextAttempt = millis() + backoff;
       }
-      rewriteOutboxFile();
+      compactOutboxFile();
     }
   } else {
     // HTTP failure or connection error — apply backoff, keep events
@@ -520,7 +541,7 @@ void CloudSyncClass::processOutbox() {
       _outbox[eligibleIdx[j]].nextAttempt = millis() + backoff;
     }
     // Persist updated retry counts to SD
-    rewriteOutboxFile();
+    compactOutboxFile();
   }
 }
 
