@@ -135,7 +135,6 @@ void setup() {
   if (fingerprintSensorOk) fpSetLed(true);
 
   CloudSync.begin(CLOUD_DEVICE_ID, CLOUD_API_KEY);
-  CloudSync.onCommand(handleCloudCommand);
   if (CloudSync.isEnabled())
     addLog("INFO", -1, "Cloud sync enabled");
   else
