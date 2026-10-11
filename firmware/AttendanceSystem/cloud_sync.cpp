@@ -81,7 +81,8 @@ void CloudSyncClass::enqueueAttendance(
   // Build the outbox item
   CloudOutboxItem item;
   memset(&item, 0, sizeof(item));
-  generateEventUid(item.eventUid, sizeof(item.eventUid), date, timeStr, fingerprintId);
+  char eventUid[48];
+  generateEventUid(eventUid, sizeof(eventUid), date, timeStr, fingerprintId);
   strncpy(item.date, date, sizeof(item.date) - 1);
   item.date[sizeof(item.date) - 1] = '\0';
   strncpy(item.timeStr, timeStr, sizeof(item.timeStr) - 1);
@@ -114,7 +115,7 @@ void CloudSyncClass::enqueueAttendance(
     Serial.println("[CLOUD] CRITICAL: RAM outbox full and SD persistence failed; cloud copy could not be queued.");
   }
 
-  Serial.printf("[CLOUD] Enqueued event uid=%s fp=%d type=%s\n", item.eventUid, fingerprintId, eventType);
+  Serial.printf("[CLOUD] Enqueued event uid=%s fp=%d type=%s\n", eventUid, fingerprintId, eventType);
 }
 
 // ──────────────────────────────────────────────
@@ -147,10 +148,13 @@ bool CloudSyncClass::persistOutboxItem(const CloudOutboxItem& item) {
     return false;
   }
 
+  // Regenerate the deterministic UID from event identity fields.
+  char eventUid[48];
+  generateEventUid(eventUid, sizeof(eventUid), item.date, item.timeStr, item.fingerprintId);
   // CSV: event_uid,date,time,fingerprint_id,name,college_id,role,department,event_type,status,retry_count,next_attempt
   String row;
   row.reserve(160);
-  row += item.eventUid;          row += ",";
+  row += eventUid;               row += ",";
   row += item.date;              row += ",";
   row += item.timeStr;           row += ",";
   row += String(item.fingerprintId); row += ",";
@@ -188,9 +192,11 @@ bool CloudSyncClass::compactOutboxFile() {
   for (int i = 0; ok && i < _outboxCount; i++) {
     const CloudOutboxItem& item = _outbox[i];
     if (item.uploaded) continue;
+    char eventUid[48];
+    generateEventUid(eventUid, sizeof(eventUid), item.date, item.timeStr, item.fingerprintId);
     String row;
     row.reserve(180);
-    row += item.eventUid; row += ","; row += item.date; row += ",";
+    row += eventUid; row += ","; row += item.date; row += ",";
     row += item.timeStr; row += ","; row += String(item.fingerprintId); row += ",";
     row += csvEscape(String(item.name)); row += ",";
     row += csvEscape(String(item.collegeId)); row += ",";
@@ -262,7 +268,8 @@ bool CloudSyncClass::loadOutboxFromSD() {
 
     CloudOutboxItem item;
     memset(&item, 0, sizeof(item));
-    strncpy(item.eventUid, fields[0].c_str(), sizeof(item.eventUid) - 1);
+    // field[0] is the persisted deterministic UID; regenerate it from identity
+    // fields to save 48 bytes per in-RAM outbox entry.
     strncpy(item.date, fields[1].c_str(), sizeof(item.date) - 1);
     strncpy(item.timeStr, fields[2].c_str(), sizeof(item.timeStr) - 1);
     item.fingerprintId = fields[3].toInt();
@@ -281,7 +288,9 @@ bool CloudSyncClass::loadOutboxFromSD() {
     // Check for duplicate event_uid already in RAM outbox
     bool dup = false;
     for (int i = 0; i < _outboxCount; i++) {
-      if (strcmp(_outbox[i].eventUid, item.eventUid) == 0) {
+      if (_outbox[i].fingerprintId == item.fingerprintId &&
+          strcmp(_outbox[i].date, item.date) == 0 &&
+          strcmp(_outbox[i].timeStr, item.timeStr) == 0) {
         dup = true;
         break;
       }
@@ -488,7 +497,9 @@ void CloudSyncClass::processOutbox() {
   for (int j = 0; j < eligibleCount; j++) {
     CloudOutboxItem& item = _outbox[eligibleIdx[j]];
     JsonObject evt = events.add<JsonObject>();
-    evt["event_uid"] = item.eventUid;
+    char eventUid[48];
+    generateEventUid(eventUid, sizeof(eventUid), item.date, item.timeStr, item.fingerprintId);
+    evt["event_uid"] = eventUid;
     evt["date"] = item.date;
     evt["time"] = item.timeStr;
     evt["fingerprint_id"] = item.fingerprintId;
