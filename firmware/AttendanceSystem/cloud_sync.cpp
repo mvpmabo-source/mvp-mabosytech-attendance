@@ -273,7 +273,8 @@ bool CloudSyncClass::loadOutboxFromSD() {
     strncpy(item.eventType, fields[8].c_str(), sizeof(item.eventType) - 1);
     strncpy(item.status, fields[9].c_str(), sizeof(item.status) - 1);
     item.retryCount = fields[10].toInt();
-    item.nextAttempt = (uint32_t)fields[11].toInt();  // stale timestamp; will be updated
+    // nextAttempt uses millis(), which resets on reboot; don't restore stale time.
+    item.nextAttempt = 0;
     item.uploaded = false;
     item.persisted = true;
 
@@ -464,11 +465,6 @@ void CloudSyncClass::processOutbox() {
     if (!_outbox[i].persisted) {
       if (sdAvailable && persistOutboxItem(_outbox[i])) _outbox[i].persisted = true;
       else continue;
-    }
-    if (_outbox[i].retryCount >= CLOUD_MAX_RETRIES) {
-      Serial.printf("[CLOUD] Event %s exceeded max retries (%d); keeping on SD.\n",
-                    _outbox[i].eventUid, _outbox[i].retryCount);
-      continue;
     }
     // Check backoff: nextAttempt is a millis() target
     if (_outbox[i].nextAttempt > 0 && (long)(now - _outbox[i].nextAttempt) < 0) {
