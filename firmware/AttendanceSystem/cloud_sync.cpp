@@ -19,6 +19,7 @@
 #include "cloud_sync.h"
 #include "app.h"
 #include <ArduinoJson.h>
+#include <esp_crt_bundle.h>
 
 CloudSyncClass CloudSync;
 
@@ -37,10 +38,9 @@ void CloudSyncClass::begin(const char* deviceId, const char* apiKey) {
   _apiKey[sizeof(_apiKey) - 1] = '\0';
   _enabled = true;
 
-  // Use the ESP32 built-in root CA certificate bundle for TLS validation.
-  // This validates the full certificate chain against the known CAs
-  // included in the mbedtls stack. No insecure mode is ever used.
-  _tls.setCACertBundle(nullptr);  // nullptr = use default system root CA bundle
+  // Arduino-ESP32 Core 3.x exposes the compiled-in trusted root bundle.
+  // Validate the actual Supabase HTTPS certificate chain; never use setInsecure().
+  _tls.setCACertBundle(esp_crt_bundle_get(), esp_crt_bundle_get_len(esp_crt_bundle_get()));
 }
 
 // ──────────────────────────────────────────────
@@ -89,10 +89,13 @@ void CloudSyncClass::enqueueAttendance(
   item.nextAttempt = 0;
   item.uploaded = false;
 
-  // Persist to SD first (durable), then add to RAM outbox if space
-  if (sdAvailable) {
-    persistOutboxItem(item);
+  // Persist first. If SD is absent or the write fails, do not enqueue an
+  // in-memory-only event that could be lost on reboot.
+  if (!sdAvailable || !persistOutboxItem(item)) {
+    Serial.println("[CLOUD] Event not queued: durable SD outbox write failed; retry will occur on next attendance event.");
+    return;
   }
+  item.persisted = true;
 
   if (_outboxCount < CLOUD_OUTBOX_MAX) {
     _outbox[_outboxCount] = item;
@@ -113,15 +116,16 @@ void CloudSyncClass::enqueueAttendance(
 bool CloudSyncClass::persistOutboxItem(const CloudOutboxItem& item) {
   if (!sdAvailable) return false;
 
-  // Append the event as a CSV row to the outbox file.
-  // The file is append-only during normal operation; it is only
-  // rewritten (compacted) after events are confirmed uploaded.
+  // SD access is serialized against sdTask; fail fast if busy.
+  if (!lockCloudSd(1000)) return false;
+  // Append-only during normal operation; compact only after server ack.
   File f = SD.open(CLOUD_OUTBOX_FILE, FILE_APPEND);
   if (!f) {
     // File doesn't exist yet — create with header
     f = SD.open(CLOUD_OUTBOX_FILE, FILE_WRITE);
     if (!f) {
       Serial.println("[CLOUD] ERROR: cannot create outbox file on SD");
+      unlockCloudSd();
       return false;
     }
     f.println(CLOUD_OUTBOX_HEADER);
@@ -148,11 +152,10 @@ bool CloudSyncClass::persistOutboxItem(const CloudOutboxItem& item) {
   f.flush();
   f.close();
 
-  if (written != row.length()) {
-    Serial.println("[CLOUD] WARNING: outbox SD write may be incomplete");
-    return false;
-  }
-  return true;
+  const bool ok = written == row.length();
+  if (!ok) Serial.println("[CLOUD] WARNING: outbox SD write may be incomplete");
+  unlockCloudSd();
+  return ok;
 }
 
 bool CloudSyncClass::rewriteOutboxFile() {
