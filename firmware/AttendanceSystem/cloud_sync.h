@@ -38,7 +38,7 @@ inline void unlockCloudSd() {
 // Bolt Database server-function endpoint is project-specific and must be set
 // in secrets_local.h. Do not point devices at a guessed or old backend URL.
 #ifndef CLOUD_BASE_URL
-#define CLOUD_BASE_URL ""
+#define CLOUD_BASE_URL "https://mfzskhrwepiyqzwrzeow.supabase.co/functions/v1/device-ingest"
 #endif
 // Public/anon application key used by the dashboard's Bolt Database client.
 // This is not a service-role/privileged key; never put a service-role key here.
