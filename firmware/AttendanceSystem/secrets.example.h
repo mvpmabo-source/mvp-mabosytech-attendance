@@ -16,5 +16,5 @@
 // The device ID must match what you registered in the cloud dashboard's
 // Settings page. The API key is generated when you add a device there —
 // copy it immediately (it is shown only once).
-#define CLOUD_DEVICE_ID "mbs-ba-mvp"
+#define CLOUD_DEVICE_ID "mbs-as-d001-mvp-2026"
 #define CLOUD_API_KEY "REPLACE_WITH_API_KEY_FROM_DASHBOARD_SETTINGS"
