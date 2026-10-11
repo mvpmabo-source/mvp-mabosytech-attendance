@@ -14,9 +14,8 @@
  *   deduplicates by event_uid so retries are safe.
  *
  * TLS:
- *   Uses the ESP32's built-in root CA certificate bundle (mbedtls)
- *   for proper chain validation against the Supabase endpoint.
- *   setInsecure() is never called.
+ *   Uses the Arduino-ESP32 built-in root CA bundle for certificate-chain
+ *   validation. Insecure TLS is never enabled.
  *
  * Heartbeat responses carry pending commands from the dashboard. A
  * callback is invoked so the main app can execute them (sync RTC,
@@ -40,6 +39,8 @@
 #define CLOUD_MAX_PENDING_CMDS 4
 #define CLOUD_MAX_RETRIES 12
 #define CLOUD_OUTBOX_FILE "/cloud_outbox.csv"
+#define CLOUD_OUTBOX_TMP_FILE "/cloud_outbox.tmp"
+#define CLOUD_OUTBOX_BACKUP_FILE "/cloud_outbox.bak"
 #define CLOUD_OUTBOX_HEADER "event_uid,date,time,fingerprint_id,name,college_id,role,department,event_type,status,retry_count,next_attempt"
 
 struct CloudOutboxItem {
@@ -56,6 +57,7 @@ struct CloudOutboxItem {
   int  retryCount;
   uint32_t nextAttempt;  // millis() target for next attempt (0 = immediate)
   bool  uploaded;        // marker: server confirmed acceptance
+  bool  persisted;       // true only after durable SD outbox write/recovery
 };
 
 struct CloudPendingCommand {
@@ -118,7 +120,8 @@ private:
 
   // SD persistent outbox helpers
   bool persistOutboxItem(const CloudOutboxItem& item);
-  bool rewriteOutboxFile();
+  bool compactOutboxFile();
+  bool recoverOutboxFiles();
   bool loadOutboxFromSD();
 };
 
