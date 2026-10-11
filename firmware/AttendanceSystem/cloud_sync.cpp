@@ -183,6 +183,7 @@ bool CloudSyncClass::compactOutboxFile() {
   File tmp = SD.open(CLOUD_OUTBOX_TMP_FILE, FILE_WRITE);
   if (!tmp) { unlockCloudSd(); return false; }
   const String header = String(CLOUD_OUTBOX_HEADER) + "\n";
+  size_t expectedBytes = header.length();
   bool ok = tmp.write((const uint8_t*)header.c_str(), header.length()) == header.length();
   for (int i = 0; ok && i < _outboxCount; i++) {
     const CloudOutboxItem& item = _outbox[i];
@@ -198,6 +199,7 @@ bool CloudSyncClass::compactOutboxFile() {
     row += item.eventType; row += ","; row += item.status; row += ",";
     row += String(item.retryCount); row += ","; row += String(item.nextAttempt); row += "\n";
     ok = tmp.write((const uint8_t*)row.c_str(), row.length()) == row.length();
+    expectedBytes += row.length();
   }
   tmp.flush();
   tmp.close();
@@ -206,6 +208,7 @@ bool CloudSyncClass::compactOutboxFile() {
   File verify = ok ? SD.open(CLOUD_OUTBOX_TMP_FILE, FILE_READ) : File();
   if (!verify) ok = false;
   if (verify) {
+    if (verify.size() != expectedBytes) ok = false;
     String gotHeader = verify.readStringUntil('\n');
     if (gotHeader != CLOUD_OUTBOX_HEADER) ok = false;
     verify.close();
