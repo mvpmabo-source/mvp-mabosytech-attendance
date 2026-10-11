@@ -66,7 +66,7 @@
 // Credentials live in secrets_local.h (via secrets.example.h template).
 // The cloud endpoint receives attendance events and heartbeats over HTTPS.
 #ifndef CLOUD_DEVICE_ID
-#define CLOUD_DEVICE_ID ""
+#define CLOUD_DEVICE_ID "mbs-as-d001-mvp-2026"
 #endif
 #ifndef CLOUD_API_KEY
 #define CLOUD_API_KEY ""
