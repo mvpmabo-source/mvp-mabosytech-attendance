@@ -126,17 +126,25 @@ bool CloudSyncClass::persistOutboxItem(const CloudOutboxItem& item) {
 
   // SD access is serialized against sdTask; fail fast if busy.
   if (!lockCloudSd(1000)) return false;
-  // Append-only during normal operation; compact only after server ack.
-  File f = SD.open(CLOUD_OUTBOX_FILE, FILE_APPEND);
-  if (!f) {
-    // File doesn't exist yet — create with header
-    f = SD.open(CLOUD_OUTBOX_FILE, FILE_WRITE);
-    if (!f) {
+  // Create and initialize a new outbox explicitly before opening append mode.
+  if (!SD.exists(CLOUD_OUTBOX_FILE)) {
+    File init = SD.open(CLOUD_OUTBOX_FILE, FILE_WRITE);
+    if (!init) {
       Serial.println("[CLOUD] ERROR: cannot create outbox file on SD");
       unlockCloudSd();
       return false;
     }
-    f.println(CLOUD_OUTBOX_HEADER);
+    const String header = String(CLOUD_OUTBOX_HEADER) + "\n";
+    const bool headerOk = init.write((const uint8_t*)header.c_str(), header.length()) == header.length();
+    init.flush();
+    init.close();
+    if (!headerOk) { unlockCloudSd(); return false; }
+  }
+  File f = SD.open(CLOUD_OUTBOX_FILE, FILE_APPEND);
+  if (!f) {
+    Serial.println("[CLOUD] ERROR: cannot append outbox file on SD");
+    unlockCloudSd();
+    return false;
   }
 
   // CSV: event_uid,date,time,fingerprint_id,name,college_id,role,department,event_type,status,retry_count,next_attempt
