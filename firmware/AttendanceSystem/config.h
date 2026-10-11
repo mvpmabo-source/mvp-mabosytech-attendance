@@ -61,6 +61,18 @@
 #define FIRMWARE_VERSION "V2.9.45"
 
 // =====================================================
+// CLOUD SYNC CONFIGURATION
+// =====================================================
+// Credentials live in secrets_local.h (via secrets.example.h template).
+// The cloud endpoint receives attendance events and heartbeats over HTTPS.
+#ifndef CLOUD_DEVICE_ID
+#define CLOUD_DEVICE_ID ""
+#endif
+#ifndef CLOUD_API_KEY
+#define CLOUD_API_KEY ""
+#endif
+
+// =====================================================
 // ROUTER / STA WI-FI CREDENTIALS
 // =====================================================
 // Edit ONLY these two values for the Wi-Fi network that should host
