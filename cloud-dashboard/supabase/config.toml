@@ -1,0 +1,6 @@
+# The device-ingest function authenticates devices using device_id + api_key
+# in the JSON body. Supabase's built-in JWT check must therefore be disabled;
+# otherwise requests without a user Authorization JWT are rejected before
+# the function's own device authentication can run.
+[functions.device-ingest]
+verify_jwt = false
