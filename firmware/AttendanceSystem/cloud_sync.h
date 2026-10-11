@@ -54,7 +54,8 @@ inline void unlockCloudSd() {
 #define CLOUD_OUTBOX_HEADER "event_uid,date,time,fingerprint_id,name,college_id,role,department,event_type,status,retry_count,next_attempt"
 
 struct CloudOutboxItem {
-  char eventUid[48];
+  // event_uid is derived from device ID + date + time + fingerprint ID,
+  // so do not store a second copy of it in every RAM record.
   char date[12];        // YYYY-MM-DD
   char timeStr[10];     // HH:MM:SS
   int  fingerprintId;
@@ -62,9 +63,9 @@ struct CloudOutboxItem {
   char collegeId[24];
   char role[16];
   char department[24];
-  char eventType[12];   // CHECK_IN / CHECK_OUT
-  char status[16];      // ON_TIME / LATE / EARLY / LEFT_EARLY / OVERTIME
-  int  retryCount;
+  char eventType[10];   // CHECK_IN / CHECK_OUT, including NUL
+  char status[12];      // LEFT_EARLY fits including NUL
+  uint8_t retryCount;
   uint32_t nextAttempt;  // millis() target for next attempt (0 = immediate)
   bool  uploaded;        // marker: server confirmed acceptance
   bool  persisted;       // true only after durable SD outbox write/recovery
