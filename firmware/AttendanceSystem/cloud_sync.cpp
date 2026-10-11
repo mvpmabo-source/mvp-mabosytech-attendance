@@ -222,10 +222,10 @@ bool CloudSyncClass::recoverOutboxFiles() {
 }
 
 bool CloudSyncClass::loadOutboxFromSD() {
-  if (!sdAvailable) return false;
+  if (!sdAvailable || !lockCloudSd(1000)) return false;
 
   File f = SD.open(CLOUD_OUTBOX_FILE, FILE_READ);
-  if (!f) return false;  // No outbox file — nothing to recover
+  if (!f) { unlockCloudSd(); return false; }  // No outbox file — nothing to recover
 
   sdReaderAttach(f);
   String fields[12];
@@ -255,6 +255,7 @@ bool CloudSyncClass::loadOutboxFromSD() {
     item.retryCount = fields[10].toInt();
     item.nextAttempt = (uint32_t)fields[11].toInt();  // stale timestamp; will be updated
     item.uploaded = false;
+    item.persisted = true;
 
     // Check for duplicate event_uid already in RAM outbox
     bool dup = false;
@@ -276,6 +277,7 @@ bool CloudSyncClass::loadOutboxFromSD() {
     }
   }
   f.close();
+  unlockCloudSd();
 
   if (loaded > 0) {
     Serial.printf("[CLOUD] Recovered %d pending events from SD outbox.\n", loaded);
@@ -284,7 +286,8 @@ bool CloudSyncClass::loadOutboxFromSD() {
 }
 
 void CloudSyncClass::recoverOutboxFromSD() {
-  if (!_enabled) return;
+  if (!_enabled || !sdAvailable) return;
+  recoverOutboxFiles();
   loadOutboxFromSD();
 }
 
