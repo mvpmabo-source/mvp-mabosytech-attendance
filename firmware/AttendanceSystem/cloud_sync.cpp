@@ -587,6 +587,14 @@ void CloudSyncClass::processOutbox() {
 // ──────────────────────────────────────────────
 
 bool CloudSyncClass::postJson(const String& body, String* responseOut, int* httpStatusOut) {
+  // TLS handshakes require a large contiguous internal-RAM allocation.
+  // Log both total and largest-block heap to distinguish low memory from
+  // fragmentation without weakening certificate verification.
+  Serial.printf("[CLOUD] TLS preflight heap=%u maxAlloc=%u minFree=%u\\n",
+                (unsigned int)ESP.getFreeHeap(),
+                (unsigned int)ESP.getMaxAllocHeap(),
+                (unsigned int)ESP.getMinFreeHeap());
+
   // Parse the URL to extract host and path
   String url = CLOUD_BASE_URL;
   url.replace("https://", "");
@@ -598,9 +606,11 @@ bool CloudSyncClass::postJson(const String& body, String* responseOut, int* http
   if (!_tls.connect(host.c_str(), 443, CLOUD_TIMEOUT_MS)) {
     char tlsError[160] = {0};
     const int tlsErrorCode = _tls.lastError(tlsError, sizeof(tlsError));
-    Serial.printf("[CLOUD] TLS connection failed: code=%d detail=%s freeHeap=%u\\n",
+    Serial.printf("[CLOUD] TLS connection failed: code=%d detail=%s heap=%u maxAlloc=%u minFree=%u\\n",
                   tlsErrorCode, tlsError[0] ? tlsError : "(no TLS detail)",
-                  (unsigned int)ESP.getFreeHeap());
+                  (unsigned int)ESP.getFreeHeap(),
+                  (unsigned int)ESP.getMaxAllocHeap(),
+                  (unsigned int)ESP.getMinFreeHeap());
     if (httpStatusOut) *httpStatusOut = 0;
     return false;
   }
