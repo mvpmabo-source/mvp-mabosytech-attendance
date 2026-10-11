@@ -637,11 +637,11 @@ bool CloudSyncClass::postJson(const String& body, String* responseOut, int* http
   );
   // Optional public/anon key for the managed function gateway. The device
   // API key remains in the JSON body and is validated server-side.
-  if (CLOUD_PUBLIC_API_KEY[0] != '\\0') {
-    _tls.printf("apikey: %s\\r\\nAuthorization: Bearer %s\\r\\n",
+  if (CLOUD_PUBLIC_API_KEY[0] != '\0') {
+    _tls.printf("apikey: %s\r\nAuthorization: Bearer %s\r\n",
                 CLOUD_PUBLIC_API_KEY, CLOUD_PUBLIC_API_KEY);
   }
-  _tls.print("Connection: close\\r\\n\\r\\n");
+  _tls.print("Connection: close\r\n\r\n");
   _tls.print(body);
 
   // Read the HTTP response status line
@@ -690,9 +690,9 @@ bool CloudSyncClass::postJson(const String& body, String* responseOut, int* http
   if (responseOut) *responseOut = responseBody;
   if (!ok) {
     String preview = responseBody;
-    preview.replace("\\r", " "); preview.replace("\\n", " ");
+    preview.replace("\r", " "); preview.replace("\n", " ");
     if (preview.length() > 180) preview.remove(180);
-    Serial.printf("[CLOUD] HTTP status %d (not 200); response=%s\\n",
+    Serial.printf("[CLOUD] HTTP status %d (not 200); response=%s\n",
                   httpStatus, preview.length() ? preview.c_str() : "(empty)");
     return false;
   }
