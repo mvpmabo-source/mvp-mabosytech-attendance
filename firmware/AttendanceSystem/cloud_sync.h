@@ -35,10 +35,15 @@ inline void unlockCloudSd() {
   if (cloudSdMutex) xSemaphoreGive(cloudSdMutex);
 }
 
-// Cloud endpoint — the deployed Supabase Edge Function for this project.
-// Override in secrets_local.h if you ever move the project.
+// Bolt Database server-function endpoint is project-specific and must be set
+// in secrets_local.h. Do not point devices at a guessed or old backend URL.
 #ifndef CLOUD_BASE_URL
-#define CLOUD_BASE_URL "https://mfzskhrwepiyqzwrzeow.supabase.co/functions/v1/device-ingest"
+#define CLOUD_BASE_URL ""
+#endif
+// Public/anon application key used by the dashboard's Bolt Database client.
+// This is not a service-role/privileged key; never put a service-role key here.
+#ifndef CLOUD_PUBLIC_API_KEY
+#define CLOUD_PUBLIC_API_KEY ""
 #endif
 
 #define CLOUD_SYNC_INTERVAL_MS 15000UL
