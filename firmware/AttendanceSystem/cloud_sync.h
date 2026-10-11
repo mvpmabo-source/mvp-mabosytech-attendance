@@ -3,9 +3,20 @@
  * cloud_sync.h — Cloud synchronization for MABOSYTECH ESP32 Attendance System
  *
  * Sends attendance events and periodic heartbeats to the hosted cloud
- * dashboard via HTTPS. Uses an outbox pattern: events are queued and
- * retried with exponential backoff. The cloud endpoint deduplicates
- * by event_uid so retries are safe.
+ * dashboard via HTTPS with proper TLS certificate validation.
+ *
+ * PERSISTENT OUTBOX:
+ *   Pending attendance events are written to a dedicated SD file
+ *   (/cloud_outbox.csv) so they survive power loss and reboot. The
+ *   outbox is recovered on boot and drained with exponential backoff.
+ *   Events are only removed from the outbox after the server explicitly
+ *   confirms acceptance (HTTP 200 + JSON {"ok":true}). The server
+ *   deduplicates by event_uid so retries are safe.
+ *
+ * TLS:
+ *   Uses the ESP32's built-in root CA certificate bundle (mbedtls)
+ *   for proper chain validation against the Supabase endpoint.
+ *   setInsecure() is never called.
  *
  * Heartbeat responses carry pending commands from the dashboard. A
  * callback is invoked so the main app can execute them (sync RTC,
@@ -23,10 +34,13 @@
 
 #define CLOUD_SYNC_INTERVAL_MS 15000UL
 #define CLOUD_HEARTBEAT_INTERVAL_MS 60000UL
-#define CLOUD_TIMEOUT_MS 10000UL
+#define CLOUD_TIMEOUT_MS 15000UL
 #define CLOUD_BATCH_SIZE 10
 #define CLOUD_OUTBOX_MAX 64
 #define CLOUD_MAX_PENDING_CMDS 4
+#define CLOUD_MAX_RETRIES 12
+#define CLOUD_OUTBOX_FILE "/cloud_outbox.csv"
+#define CLOUD_OUTBOX_HEADER "event_uid,date,time,fingerprint_id,name,college_id,role,department,event_type,status,retry_count,next_attempt"
 
 struct CloudOutboxItem {
   char eventUid[48];
@@ -40,7 +54,8 @@ struct CloudOutboxItem {
   char eventType[12];   // CHECK_IN / CHECK_OUT
   char status[16];      // ON_TIME / LATE / EARLY / LEFT_EARLY / OVERTIME
   int  retryCount;
-  unsigned long nextAttemptMs;
+  uint32_t nextAttempt;  // millis() target for next attempt (0 = immediate)
+  bool  uploaded;        // marker: server confirmed acceptance
 };
 
 struct CloudPendingCommand {
@@ -49,6 +64,8 @@ struct CloudPendingCommand {
   char payload[64];
 };
 
+// Callback type for handling a command from the cloud.
+// Return true if the command was executed successfully.
 typedef bool (*CloudCommandCallback)(const char* command, const char* payload);
 
 class CloudSyncClass {
@@ -73,7 +90,10 @@ public:
 
   void onCommand(CloudCommandCallback cb) { _commandCallback = cb; }
 
-  int pendingCount() const { return _outboxHead; }
+  int pendingCount() const { return _outboxCount; }
+
+  // Call after SD is mounted and ready. Loads any persisted pending events.
+  void recoverOutboxFromSD();
 
 private:
   bool _enabled = false;
@@ -83,18 +103,23 @@ private:
   CloudCommandCallback _commandCallback = nullptr;
 
   CloudOutboxItem _outbox[CLOUD_OUTBOX_MAX];
-  int _outboxHead = 0;
+  int _outboxCount = 0;
 
   CloudPendingCommand _pendingAcks[CLOUD_MAX_PENDING_CMDS];
   int _pendingAckCount = 0;
 
   unsigned long _lastSyncMs = 0;
 
-  bool postJson(const String& body, String* responseOut = nullptr);
+  bool postJson(const String& body, String* responseOut, int* httpStatusOut);
   void processOutbox();
   void generateEventUid(char* buf, size_t bufLen, const char* date, const char* timeStr, int fpId);
   void processHeartbeatResponse(const String& response);
   void sendCommandAcks();
+
+  // SD persistent outbox helpers
+  bool persistOutboxItem(const CloudOutboxItem& item);
+  bool rewriteOutboxFile();
+  bool loadOutboxFromSD();
 };
 
 extern CloudSyncClass CloudSync;
