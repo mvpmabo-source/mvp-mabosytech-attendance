@@ -73,15 +73,17 @@ export function SettingsPage() {
         .update({ api_key_hash: apiKeyHash, updated_at: new Date().toISOString() })
         .eq("device_id", deviceId);
       if (updateErr) throw new Error(updateErr.message);
+      // Key rotation has already succeeded. Do not hide the one-time key
+      // if the optional audit write fails.
       const { error: auditErr } = await supabase.from("audit_log").insert({
         user_id: user?.id,
         action: "device_api_key_rotated",
         target: deviceId,
         details: { reason: "manual_rotation" },
       });
-      if (auditErr) throw new Error(auditErr.message);
       setGeneratedDeviceId(deviceId);
       setGeneratedKey(apiKey);
+      if (auditErr) setError("API key rotated successfully, but audit logging failed: " + auditErr.message);
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to rotate device API key");
