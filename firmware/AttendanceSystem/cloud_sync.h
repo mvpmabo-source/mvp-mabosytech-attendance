@@ -25,6 +25,14 @@
 #include <WiFiClientSecure.h>
 #include "config.h"
 
+extern SemaphoreHandle_t cloudSdMutex;
+inline bool lockCloudSd(uint32_t timeoutMs = 1000) {
+  return cloudSdMutex && xSemaphoreTake(cloudSdMutex, pdMS_TO_TICKS(timeoutMs)) == pdTRUE;
+}
+inline void unlockCloudSd() {
+  if (cloudSdMutex) xSemaphoreGive(cloudSdMutex);
+}
+
 // Cloud endpoint — the deployed Supabase Edge Function for this project.
 // Override in secrets_local.h if you ever move the project.
 #ifndef CLOUD_BASE_URL
