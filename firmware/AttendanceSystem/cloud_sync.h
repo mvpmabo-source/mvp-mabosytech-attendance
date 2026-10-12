@@ -48,7 +48,7 @@ inline void unlockCloudSd() {
 
 #define CLOUD_SYNC_INTERVAL_MS 15000UL
 #define CLOUD_HEARTBEAT_INTERVAL_MS 60000UL
-#define CLOUD_TIMEOUT_MS 4000UL
+#define CLOUD_TIMEOUT_MS 2000UL
 #define CLOUD_BATCH_SIZE 10
 #define CLOUD_OUTBOX_MAX 12  // RAM window only; remaining pending events stay on SD
 #define CLOUD_MAX_PENDING_CMDS 4  // extra commands remain pending on the server until a slot opens
