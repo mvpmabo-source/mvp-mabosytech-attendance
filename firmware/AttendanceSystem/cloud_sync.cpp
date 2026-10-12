@@ -817,10 +817,9 @@ bool CloudSyncClass::postJson(const String& body, String* responseOut, int* http
   _tls.print("Connection: close\r\n\r\n");
   _tls.print(body);
 
-  // Parse status/headers explicitly, then consume the response according to
-  // HTTP framing. Supabase/Edge gateways may return chunked bodies; feeding
-  // chunk markers to ArduinoJson silently prevented heartbeat commands reaching
-  // the callback even though the heartbeat itself was stored successfully.
+  // Read complete HTTP lines only after bytes are actually available. Stream's
+  // readStringUntil() can time out before the first server byte arrives; that
+  // previously made the status parser treat a timeout as a blank header line.
   _tls.setTimeout(1000);
   bool ok = false;
   bool chunked = false;
@@ -831,23 +830,56 @@ bool CloudSyncClass::postJson(const String& body, String* responseOut, int* http
   String responseBody;
   responseBody.reserve(768);
 
-  String statusLine = _tls.readStringUntil('\n');
-  statusLine.trim();
-  if (statusLine.startsWith("HTTP/")) {
+  auto readHttpLine = [&](String& line, size_t maxLineLength) -> bool {
+    line = "";
+    while ((long)(deadline - millis()) > 0) {
+      if (_tls.available() <= 0) {
+        if (!_tls.connected()) return false;
+        delay(1);
+        continue;
+      }
+
+      const int ch = _tls.read();
+      if (ch < 0) continue;
+      if (ch == '\n') return true;
+      if (ch == '\r') continue;
+      if (line.length() >= maxLineLength) {
+        Serial.println("[CLOUD] HTTP line exceeded safety limit.");
+        return false;
+      }
+      line += (char)ch;
+    }
+    return false;
+  };
+
+  // Tolerate at most a few leading CRLFs, but never mistake a read timeout for
+  // a genuine blank line. Require a real HTTP status line before reading headers.
+  String statusLine;
+  bool gotStatusLine = false;
+  for (uint8_t skipped = 0; skipped < 4; ++skipped) {
+    if (!readHttpLine(statusLine, 512)) break;
+    statusLine.trim();
+    if (statusLine.length() == 0) continue;
+    gotStatusLine = true;
+    break;
+  }
+
+  if (gotStatusLine && statusLine.startsWith("HTTP/")) {
     const int spaceIdx = statusLine.indexOf(' ');
     if (spaceIdx >= 0 && statusLine.length() >= (unsigned)(spaceIdx + 4)) {
       httpStatus = statusLine.substring(spaceIdx + 1, spaceIdx + 4).toInt();
       ok = (httpStatus == 200);
     }
   } else {
-    Serial.printf("[CLOUD] HTTP status line malformed: %s\n",
-                  statusLine.length() ? statusLine.c_str() : "(empty)");
+    Serial.printf("[CLOUD] HTTP status line invalid/unavailable: %s\n",
+                  statusLine.length() ? statusLine.c_str() : "(timeout or empty)");
   }
 
-  // Read headers through the first blank line.
+  // Parse headers and their framing metadata up to a genuine blank line.
   bool headersDone = false;
-  while (_tls.connected() && (long)(deadline - millis()) > 0) {
-    String header = _tls.readStringUntil('\n');
+  while ((long)(deadline - millis()) > 0) {
+    String header;
+    if (!readHttpLine(header, 512)) break;
     header.trim();
     if (header.length() == 0) {
       headersDone = true;
@@ -871,22 +903,28 @@ bool CloudSyncClass::postJson(const String& body, String* responseOut, int* http
     }
   }
 
-  // Wait briefly for one byte without blocking forever on a stalled server.
+  // Exact-byte reader shared by Content-Length and chunked framing.
   auto readResponseByte = [&]() -> int {
-    while (!_tls.available() && _tls.connected() && (long)(deadline - millis()) > 0) {
+    while ((long)(deadline - millis()) > 0) {
+      if (_tls.available() > 0) return _tls.read();
+      if (!_tls.connected()) return -1;
       delay(1);
     }
-    return _tls.available() ? _tls.read() : -1;
+    return -1;
   };
 
-  bool bodyReadOk = headersDone;
+  bool bodyReadOk = headersDone && gotStatusLine && statusLine.startsWith("HTTP/");
   if (!headersDone) {
     Serial.println("[CLOUD] HTTP response headers were incomplete.");
     bodyReadOk = false;
   } else if (chunked) {
-    // Decode chunked transfer encoding before exposing JSON to callers.
+    // Decode RFC 9112 chunked transfer encoding before exposing JSON to callers.
     while ((long)(deadline - millis()) > 0) {
-      String sizeLine = _tls.readStringUntil('\n');
+      String sizeLine;
+      if (!readHttpLine(sizeLine, 64)) {
+        bodyReadOk = false;
+        break;
+      }
       sizeLine.trim();
       if (sizeLine.length() == 0) continue;
 
@@ -905,8 +943,9 @@ bool CloudSyncClass::postJson(const String& body, String* responseOut, int* http
 
       if (chunkSize == 0) {
         // Consume optional trailers; they are not part of the JSON body.
-        while (_tls.connected() && (long)(deadline - millis()) > 0) {
-          String trailer = _tls.readStringUntil('\n');
+        while ((long)(deadline - millis()) > 0) {
+          String trailer;
+          if (!readHttpLine(trailer, 512)) break;
           trailer.trim();
           if (trailer.length() == 0) break;
         }
