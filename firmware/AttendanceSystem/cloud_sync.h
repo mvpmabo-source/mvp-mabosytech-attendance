@@ -51,7 +51,7 @@ inline void unlockCloudSd() {
 #define CLOUD_TIMEOUT_MS 15000UL
 #define CLOUD_BATCH_SIZE 10
 #define CLOUD_OUTBOX_MAX 64
-#define CLOUD_MAX_PENDING_CMDS 4
+#define CLOUD_MAX_PENDING_CMDS 8
 #define CLOUD_MAX_RETRIES 12
 #define CLOUD_OUTBOX_FILE "/cloud_outbox.csv"
 #define CLOUD_OUTBOX_TMP_FILE "/cloud_outbox.tmp"
@@ -77,14 +77,17 @@ struct CloudOutboxItem {
 };
 
 struct CloudPendingCommand {
-  int  id;
-  char command[16];     // "sync_time" / "restart"
-  char payload[64];
+  char id[40];          // UUID from device_commands.id (or a legacy numeric ID)
+  char command[32];
+  char payload[192];    // serialized JSON payload
+  char result[128];     // serialized result JSON for the dashboard
+  bool ackReady;
+  bool succeeded;
 };
 
-// Callback type for handling a command from the cloud.
-// Return true if the command was executed successfully.
-typedef bool (*CloudCommandCallback)(const char* command, const char* payload);
+// The handler can complete immediately or keep a command pending until a
+// long-running operation (such as fingerprint enrollment) actually finishes.
+typedef void (*CloudCommandCallback)(const char* commandId, const char* command, const char* payload);
 
 class CloudSyncClass {
 public:
@@ -107,6 +110,8 @@ public:
   );
 
   void onCommand(CloudCommandCallback cb) { _commandCallback = cb; }
+  void completeCommand(const char* commandId, bool success, const char* resultJson = nullptr);
+  void flushCommandAcks();
 
   int pendingCount() const { return _outboxCount; }
 
