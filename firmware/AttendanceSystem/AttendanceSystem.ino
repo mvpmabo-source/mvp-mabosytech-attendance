@@ -300,9 +300,10 @@ void loop() {
         unlockState();
       }
       if (activeCloudEnrollCommandId[0]) {
-        CloudSync.completeCommand(activeCloudEnrollCommandId, cloudEnrollSucceeded,
-          cloudEnrollSucceeded ? "{\"ok\":true,\"message\":\"fingerprint_enrolled\"}" :
-                                 "{\"ok\":false,\"error\":\"enrollment_failed_or_cancelled\"}");
+        String enrollResult = cloudEnrollSucceeded
+          ? (String("{\"ok\":true,\"message\":\"fingerprint_enrolled\",\"fingerprint_id\":") + String(targetId) + "}")
+          : String("{\"ok\":false,\"error\":\"enrollment_failed_or_cancelled\"}");
+        CloudSync.completeCommand(activeCloudEnrollCommandId, cloudEnrollSucceeded, enrollResult.c_str());
         activeCloudEnrollCommandId[0] = '\0';
         CloudSync.flushCommandAcks();
       }
