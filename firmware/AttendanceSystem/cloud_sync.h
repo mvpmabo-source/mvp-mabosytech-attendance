@@ -120,6 +120,7 @@ public:
 
   // Call after SD is mounted and ready. Loads any persisted pending events.
   void recoverOutboxFromSD();
+  void clearOutboxRamForFactoryReset();
 
 private:
   bool _enabled = false;
