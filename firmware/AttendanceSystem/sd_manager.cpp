@@ -888,7 +888,7 @@ bool resetAllLocalDataOnSd() {
   };
   for (const char* path : files) {
     if (SD.exists(path) && !SD.remove(path) && SD.exists(path)) {
-      Serial.printf("[RESET] Could not remove %s\\n", path);
+      Serial.printf("[RESET] Could not remove %s\n", path);
       return false;
     }
   }
@@ -897,7 +897,7 @@ bool resetAllLocalDataOnSd() {
     if (!f) return false;
     const size_t n = strlen(header);
     const bool ok = f.write((const uint8_t*)header, n) == n &&
-                    f.write((const uint8_t*)"\\n", 1) == 1;
+                    f.write((const uint8_t*)"\n", 1) == 1;
     f.flush();
     f.close();
     File v = ok ? SD.open(path, FILE_READ) : File();
