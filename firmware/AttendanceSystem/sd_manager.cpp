@@ -881,6 +881,24 @@ bool tryQuickSdMount() {
 bool resetAllLocalDataOnSd() {
   if (!sdAvailable) return false;
   // This function is called only by sdTask, the sole SD filesystem owner.
+  // Stop old queued writes first so no pre-reset attendance row can reappear.
+  if (attendanceQueue) xQueueReset(attendanceQueue);
+  if (lessonAppendQueue) xQueueReset(lessonAppendQueue);
+  if (systemLogQueue) xQueueReset(systemLogQueue);
+  pendingHead = pendingTail = pendingUsed = 0;
+  pendingDropped = pendingQueueDropped = 0;
+  for (int i = 0; i < MAX_PENDING; ++i) {
+    pendingRows[i].csv = "";
+    pendingRows[i].seq = 0;
+    pendingRows[i].recovery = false;
+  }
+  g_lessonRetryActive = false;
+  g_systemLogRetryActive = false;
+  g_lessonJournalClearRetryMask = 0;
+  if (!clearAllTeacherProfilesAndPresence()) {
+    Serial.println("[RESET] Could not clear durable profile/journal state.");
+    return false;
+  }
   const char* files[] = {
     SD_LOG_FILE, SD_LEGACY_LOG_FILE, SD_ATTENDANCE_TMP_FILE,
     SD_LESSONS_FILE, SD_SYSLOG_FILE,
