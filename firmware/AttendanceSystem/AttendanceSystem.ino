@@ -699,7 +699,7 @@ static void handleCloudCommand(const char* commandId, const char* command, const
     // ACK it without restarting a second time.
     const String previousRestartId = prefsGetString("last_restart_cmd", "");
     if (previousRestartId == String(commandId)) {
-      Serial.printf("[CLOUD] Duplicate restart command %s; ACK only, no reboot.\\n", commandId);
+      Serial.printf("[CLOUD] Duplicate restart command %s; ACK only, no reboot.\n", commandId);
       CloudSync.completeCommand(commandId, true, "{\"ok\":true,\"message\":\"restart_already_executed\"}");
       CloudSync.flushCommandAcks();
       return;
@@ -789,7 +789,7 @@ static void handleCloudCommand(const char* commandId, const char* command, const
       if (nextEnrollID == 0 || id < nextEnrollID) nextEnrollID = (uint16_t)id;
       CloudSync.completeCommand(commandId, true, "{\"ok\":true,\"message\":\"fingerprint_deleted_and_verified\"}");
     } else {
-      Serial.printf("[FP] Delete ID %d not confirmed: delete=0x%02X verify=0x%02X\\n", id, result, verify);
+      Serial.printf("[FP] Delete ID %d not confirmed: delete=0x%02X verify=0x%02X\n", id, result, verify);
       CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"sensor_delete_not_verified\"}");
     }
     CloudSync.flushCommandAcks();
