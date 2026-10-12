@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Cpu, Wifi, HardDrive, Clock, Fingerprint, RotateCw, CalendarClock, CheckCircle2, XCircle, AlertTriangle, RefreshCw } from "lucide-react";
+import { Cpu, Wifi, HardDrive, Clock, Fingerprint, RotateCw, CalendarClock, CheckCircle2, XCircle, AlertTriangle, RefreshCw, Trash2 } from "lucide-react";
 import { supabase, type DeviceHeartbeat, type DeviceCommand, type Device } from "@/lib/supabase";
 import { Card, LoadingSpinner, EmptyState, ErrorState, Badge, timeAgo, isStale } from "@/components/ui";
 import { useAuth } from "@/context/AuthContext";
@@ -30,7 +30,7 @@ export function DevicePage() {
 
   useEffect(() => { load(); const interval = setInterval(load, 15000); return () => clearInterval(interval); }, []);
 
-  const sendCommand = async (command: "restart" | "sync_time") => {
+  const sendCommand = async (command: "restart" | "sync_time" | "factory_reset") => {
     setSendingCmd(true);
     try {
       const { error: cmdErr } = await supabase.from("device_commands").insert({ device_id: device?.device_id ?? heartbeat?.device_id ?? "default", command, payload: command === "sync_time" ? { epoch: Math.floor(Date.now() / 1000) } : {}, status: "pending", created_by: user?.id });
@@ -78,7 +78,7 @@ export function DevicePage() {
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <Card className="p-5"><h3 className="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><CalendarClock className="w-4 h-4 text-slate-400" /> Schedule</h3><dl className="space-y-3"><div className="flex justify-between text-sm"><dt className="text-slate-500">Check-in Time</dt><dd className="font-medium text-slate-700">{heartbeat.checkin_time ?? "—"}</dd></div><div className="flex justify-between text-sm"><dt className="text-slate-500">Check-out Time</dt><dd className="font-medium text-slate-700">{heartbeat.checkout_time ?? "—"}</dd></div><div className="flex justify-between text-sm"><dt className="text-slate-500">Last Heartbeat</dt><dd className="font-medium text-slate-700">{timeAgo(heartbeat.received_at)}</dd></div></dl></Card>
-            <Card className="p-5"><h3 className="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><RotateCw className="w-4 h-4 text-slate-400" /> Device Commands</h3><div className="flex gap-2 mb-4"><button onClick={() => sendCommand("sync_time")} disabled={sendingCmd} className="flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-50 transition-colors"><Clock className="w-4 h-4" />Sync Time</button><button onClick={() => sendCommand("restart")} disabled={sendingCmd} className="flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-lg border border-amber-200 text-amber-600 hover:bg-amber-50 disabled:opacity-50 transition-colors"><RotateCw className="w-4 h-4" />Restart</button></div><p className="text-xs text-slate-400">Commands are delivered when the device polls the cloud. Only safe, allowlisted actions are supported.</p></Card>
+            <Card className="p-5"><h3 className="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><RotateCw className="w-4 h-4 text-slate-400" /> Device Commands</h3><div className="flex gap-2 mb-4"><button onClick={() => sendCommand("sync_time")} disabled={sendingCmd} className="flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-50 transition-colors"><Clock className="w-4 h-4" />Sync Time</button><button onClick={() => sendCommand("restart")} disabled={sendingCmd || commands.some((c) => c.command === "restart" && c.status === "pending")} className="flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-lg border border-amber-200 text-amber-600 hover:bg-amber-50 disabled:opacity-50 transition-colors"><RotateCw className="w-4 h-4" />Restart</button><button onClick={() => { if (window.confirm("CLEAN START: This permanently deletes ALL fingerprint templates on the sensor, teacher profiles, attendance history, lessons, system logs and pending cloud events on this device and cloud registry. Device Wi-Fi/cloud credentials and schedule settings will remain. Continue?")) void sendCommand("factory_reset"); }} disabled={sendingCmd || commands.some((c) => c.command === "factory_reset" && c.status === "pending")} className="flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-lg border border-rose-300 text-rose-700 hover:bg-rose-50 disabled:opacity-50 transition-colors"><Trash2 className="w-4 h-4" />Clean Start</button></div><p className="text-xs text-slate-400">Commands are delivered when the device polls the cloud. Only safe, allowlisted actions are supported.</p></Card>
           </div>
           {commands.length > 0 && (
             <Card className="overflow-hidden">
