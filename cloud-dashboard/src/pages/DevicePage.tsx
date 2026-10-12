@@ -33,7 +33,7 @@ export function DevicePage() {
   const sendCommand = async (command: "restart" | "sync_time") => {
     setSendingCmd(true);
     try {
-      const { error: cmdErr } = await supabase.from("device_commands").insert({ device_id: device?.device_id ?? heartbeat?.device_id ?? "default", command, payload: {}, status: "pending", created_by: user?.id });
+      const { error: cmdErr } = await supabase.from("device_commands").insert({ device_id: device?.device_id ?? heartbeat?.device_id ?? "default", command, payload: command === "sync_time" ? { epoch: Math.floor(Date.now() / 1000) } : {}, status: "pending", created_by: user?.id });
       if (cmdErr) throw new Error(cmdErr.message);
       await load();
     } catch (err) { setError(err instanceof Error ? err.message : "Failed to send command"); } finally { setSendingCmd(false); }
