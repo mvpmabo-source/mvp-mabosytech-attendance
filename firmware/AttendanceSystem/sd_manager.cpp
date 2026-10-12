@@ -403,6 +403,16 @@ void sdTaskFunc(void *pv) {
       continue;
     }
 
+    if (factoryResetSdRequested) {
+      const bool resetOk = resetAllLocalDataOnSd();
+      factoryResetSdOk = resetOk;
+      factoryResetSdDone = true;
+      factoryResetSdRequested = false;
+      unlockCloudSd();
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+
     if (!attendanceBootReady && sdAvailable) {
       const unsigned long nowBoot = millis();
       if ((long)(nowBoot - nextBootPreparationRetryMs) >= 0) {
@@ -866,6 +876,53 @@ bool tryQuickSdMount() {
   Serial.println("[SD]   3. CS=GPIO4  SCK=GPIO23  MISO=GPIO19  MOSI=GPIO18");
   Serial.println("[SD]   4. Try a different microSD card (counterfeits are common)");
   return false;
+}
+
+bool resetAllLocalDataOnSd() {
+  if (!sdAvailable) return false;
+  // This function is called only by sdTask, the sole SD filesystem owner.
+  const char* files[] = {
+    SD_LOG_FILE, SD_LEGACY_LOG_FILE, SD_ATTENDANCE_TMP_FILE,
+    SD_LESSONS_FILE, SD_SYSLOG_FILE,
+    CLOUD_OUTBOX_FILE, CLOUD_OUTBOX_TMP_FILE, CLOUD_OUTBOX_BACKUP_FILE
+  };
+  for (const char* path : files) {
+    if (SD.exists(path) && !SD.remove(path) && SD.exists(path)) {
+      Serial.printf("[RESET] Could not remove %s\\n", path);
+      return false;
+    }
+  }
+  auto writeHeader = [](const char* path, const char* header) -> bool {
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) return false;
+    const size_t n = strlen(header);
+    const bool ok = f.write((const uint8_t*)header, n) == n &&
+                    f.write((const uint8_t*)"\\n", 1) == 1;
+    f.flush();
+    f.close();
+    File v = ok ? SD.open(path, FILE_READ) : File();
+    const bool verified = v && v.size() == n + 1;
+    if (v) v.close();
+    return verified;
+  };
+  if (!writeHeader(SD_LOG_FILE, ATTENDANCE_CSV_HEADER) ||
+      !writeHeader(SD_LESSONS_FILE, LESSONS_CSV_HEADER) ||
+      !writeHeader(SD_SYSLOG_FILE, SYSTEM_LOG_HEADER)) {
+    Serial.println("[RESET] Failed to recreate verified empty data files.");
+    return false;
+  }
+  sdRecordCount = 0;
+  sdLessonCount = 0;
+  sdStatValid = false;
+  sdCsvBytesCache = strlen(ATTENDANCE_CSV_HEADER) + 1;
+  sdLessonsBytesCache = strlen(LESSONS_CSV_HEADER) + 1;
+  sdTotalBytesCache = SD.cardSize();
+  sdUsedBytesCache = SD.usedBytes();
+  sdUsedBytesAtMs = millis();
+  sdStatAtMs = millis();
+  sdStatValid = true;
+  Serial.println("[RESET] SD attendance, lessons, system log and cloud outbox cleared.");
+  return true;
 }
 
 void initializeSD() {
