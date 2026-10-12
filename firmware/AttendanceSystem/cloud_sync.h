@@ -88,6 +88,7 @@ struct CloudPendingCommand {
 // The handler can complete immediately or keep a command pending until a
 // long-running operation (such as fingerprint enrollment) actually finishes.
 typedef void (*CloudCommandCallback)(const char* commandId, const char* command, const char* payload);
+typedef void (*CloudSettingsCallback)(const char* settingsJson);
 
 class CloudSyncClass {
 public:
@@ -110,6 +111,7 @@ public:
   );
 
   void onCommand(CloudCommandCallback cb) { _commandCallback = cb; }
+  void onSettings(CloudSettingsCallback cb) { _settingsCallback = cb; }
   void completeCommand(const char* commandId, bool success, const char* resultJson = nullptr);
   void flushCommandAcks();
 
@@ -124,6 +126,7 @@ private:
   char _apiKey[80];
   WiFiClientSecure _tls;
   CloudCommandCallback _commandCallback = nullptr;
+  CloudSettingsCallback _settingsCallback = nullptr;
 
   CloudOutboxItem _outbox[CLOUD_OUTBOX_MAX];
   int _outboxCount = 0;
