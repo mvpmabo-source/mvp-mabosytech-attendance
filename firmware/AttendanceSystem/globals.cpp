@@ -314,6 +314,10 @@ TaskHandle_t sdTaskHandle  = nullptr;
 
 
 bool pendingRestart=false;
+volatile bool factoryResetSdRequested = false;
+volatile bool factoryResetSdDone = false;
+volatile bool factoryResetSdOk = false;
+
 unsigned long pendingRestartAtMs=0;
 
 volatile bool dashboardBootReady = false;
