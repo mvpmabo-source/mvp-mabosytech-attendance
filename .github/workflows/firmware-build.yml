@@ -40,4 +40,16 @@ jobs:
         working-directory: firmware/AttendanceSystem
         run: cp secrets.example.h secrets_local.h
       - name: Compile ESP32 firmware
-        run: arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs --warnings all firmware/AttendanceSystem
+        run: |
+          mkdir -p "$RUNNER_TEMP/firmware-build"
+          arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs --warnings all --output-dir "$RUNNER_TEMP/firmware-build" firmware/AttendanceSystem
+          ls -lah "$RUNNER_TEMP/firmware-build"
+          test -s "$RUNNER_TEMP/firmware-build/AttendanceSystem.ino.bin"
+
+      - name: Upload compiled ESP32 firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-firmware-\${{ github.sha }}
+          path: \${{ runner.temp }}/firmware-build/*.bin
+          if-no-files-found: error
+          retention-days: 14
