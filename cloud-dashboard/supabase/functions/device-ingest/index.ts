@@ -419,12 +419,17 @@ Deno.serve(async (req: Request) => {
         if (ackStatus === "acknowledged" && resultOk && idMatches) {
           const { error: teacherError } = await adminClient
             .from("teachers")
-            .update({
+            .upsert({
+              fingerprint_id: requestedFingerprintId,
+              name: String(payload.name || ""),
+              college_id: String(payload.college_id || ""),
+              role: String(payload.role || "Teacher"),
+              department: String(payload.department || ""),
+              note: String(payload.note || ""),
               enrollment_status: "enrolled",
               enrolled_at: new Date().toISOString(),
               updated_at: new Date().toISOString(),
-            })
-            .eq("fingerprint_id", requestedFingerprintId);
+            }, { onConflict: "fingerprint_id" });
           if (teacherError) {
             console.error("Teacher enrollment status update failed:", teacherError.message);
           }
@@ -436,6 +441,32 @@ Deno.serve(async (req: Request) => {
           if (teacherError) {
             console.error("Teacher enrollment failure status update failed:", teacherError.message);
           }
+        }
+      }
+
+      // Only mutate cloud teacher/history records after the authenticated
+      // device has confirmed the physical operation succeeded.
+      const isDelete = ["delete_fingerprint", "delete_fingerprint_template"].includes(commandRow.command || "");
+      if (isDelete && ackStatus === "acknowledged" && result.ok === true) {
+        const deleteId = Number(payload.fingerprint_id || payload.template_id || 0);
+        if (Number.isInteger(deleteId) && deleteId >= 1 && deleteId <= 200) {
+          const { error: teacherDeleteError } = await adminClient
+            .from("teachers").delete().eq("fingerprint_id", deleteId);
+          if (teacherDeleteError) {
+            return jsonError(500, "Teacher delete failed after sensor confirmation", { detail: teacherDeleteError.message });
+          }
+        }
+      }
+
+      if (commandRow.command === "factory_reset" && ackStatus === "acknowledged" && result.ok === true) {
+        const deletions = await Promise.all([
+          adminClient.from("attendance_events").delete().eq("device_id", String(device.device_id)),
+          adminClient.from("device_heartbeats").delete().eq("device_id", String(device.device_id)),
+          adminClient.from("teachers").delete().neq("fingerprint_id", 0),
+        ]);
+        const failed = deletions.find((entry) => entry.error);
+        if (failed?.error) {
+          return jsonError(500, "Cloud clean-start cleanup failed", { detail: failed.error.message });
         }
       }
 
