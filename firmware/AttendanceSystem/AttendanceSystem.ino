@@ -63,7 +63,9 @@ void setup() {
   // without making the SD task wait for every network write.
   lessonAppendQueue= xQueueCreate(8,  sizeof(LessonAppend));
   systemLogQueue   = xQueueCreate(32, sizeof(SystemLogEvent));
-  // The legacy browser-time-sync queue is unused in cloud-only mode.
+  // Cloud sync_time commands enqueue a validated UTC epoch; loop() owns all RTC/I2C writes.
+  browserTimeSyncQueue = xQueueCreate(1, sizeof(uint32_t));
+  if (!browserTimeSyncQueue) Serial.println("[RTC] WARNING: browser/cloud time-sync queue allocation failed.");
 
   prefs.begin("fps_db", false);
   loadAttendanceJournal();
@@ -187,6 +189,7 @@ void loop() {
   // Keep Wire/DS3231 and Preferences out of AsyncTCP callbacks. The network
   // callback only enqueues the browser epoch; loop() owns the actual write.
   serviceDeviceSetupPersistence();
+  serviceBrowserTimeSync();
 
   serviceLedBuzzerTimers();
   serviceWeekendAttendanceFeedback();
@@ -236,6 +239,8 @@ void loop() {
   if (lockState()) { if (!isEnrolling && dashboardEnrollRequest) startRequested = true; unlockState(); }
 
   if (startRequested) {
+    // Show immediate feedback before any slot scan or sensor operation.
+    oledScreen("ENROLLMENT", "Preparing sensor", "Please wait...");
     String eName, eCollege, eRole, eDept, eNote;
     uint16_t targetId;
     uint16_t requestedCloudTargetId = 0;
@@ -252,10 +257,25 @@ void loop() {
 
     // If the dashboard supplied a specific slot, verify it is definitely empty
     // before asking the sensor to store there. This prevents accidental overwrite.
-    const uint8_t requestedSlotStatus =
+    uint8_t requestedSlotStatus =
       (requestedCloudTargetId > 0 && targetId > 0)
         ? cloudFingerprintSlotStatus(targetId)
         : CLOUD_FP_SLOT_EMPTY_CODE;
+
+    // Dashboard records can contain a stale/occupied slot number. Never overwrite it:
+    // automatically pick a positively verified empty sensor slot instead.
+    if (requestedCloudTargetId > 0 && requestedSlotStatus == FINGERPRINT_OK) {
+      Serial.printf("[CLOUD] Requested fingerprint slot %u is occupied; searching for a free slot.\\n", (unsigned)targetId);
+      const uint16_t fallbackId = findNextFreeFrom(1);
+      if (fallbackId >= 1 && fallbackId <= MAX_FINGERPRINTS) {
+        Serial.printf("[CLOUD] Using verified free fingerprint slot %u instead.\\n", (unsigned)fallbackId);
+        targetId = fallbackId;
+        requestedCloudTargetId = 0;
+        requestedSlotStatus = CLOUD_FP_SLOT_EMPTY_CODE;
+      } else {
+        Serial.println("[CLOUD] Could not safely find a free slot; refusing to overwrite a template.");
+      }
+    }
 
     if (targetId == 0) {
       addLog("ERROR", -1, "Fingerprint database full (200/200). Delete a record to free a slot.");
