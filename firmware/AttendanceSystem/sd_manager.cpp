@@ -895,6 +895,13 @@ bool resetAllLocalDataOnSd() {
   g_lessonRetryActive = false;
   g_systemLogRetryActive = false;
   g_lessonJournalClearRetryMask = 0;
+  portENTER_CRITICAL(&g_lessonJournalMux);
+  g_lessonJournalQueuedMask = 0;
+  portEXIT_CRITICAL(&g_lessonJournalMux);
+  if (lockState(50)) {
+    systemLogFallbackCount = 0;
+    unlockState();
+  }
   if (!clearAllTeacherProfilesAndPresence()) {
     Serial.println("[RESET] Could not clear durable profile/journal state.");
     return false;
