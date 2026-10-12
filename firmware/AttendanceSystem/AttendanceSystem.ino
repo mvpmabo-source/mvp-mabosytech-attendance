@@ -9,6 +9,87 @@ static void handleCloudSettings(const char* settingsJson);
 static char activeCloudEnrollCommandId[40] = "";
 static uint16_t pendingCloudEnrollTargetId = 0;
 static constexpr uint8_t CLOUD_FP_SLOT_EMPTY_CODE = 0x0C;
+static volatile uint8_t factoryResetStage = 0;
+static char activeFactoryResetCommandId[40] = "";
+
+static void finishFactoryResetCommand(bool ok, const char* error) {
+  if (activeFactoryResetCommandId[0]) {
+    String result = ok
+      ? String("{\"ok\":true,\"message\":\"factory_reset_complete\"}")
+      : String("{\"ok\":false,\"error\":\"") + (error ? error : "factory_reset_failed") + "\"}";
+    CloudSync.completeCommand(activeFactoryResetCommandId, ok, result.c_str());
+    activeFactoryResetCommandId[0] = '\\0';
+    CloudSync.flushCommandAcks();
+  }
+  factoryResetStage = 0;
+  isEnrolling = false;
+  factoryResetSdRequested = false;
+}
+
+static void clearFactoryResetRamState() {
+  if (lockState(500)) {
+    logCount = 0; logWriteIndex = 0; logSeqCounter = 0;
+    entryCount = 0; exitCount = 0; lastEntryId = -1;
+    ramDropped = 0; tickLastRamDroppedSeen = 0;
+    cachedLastEntryJsonForId = -1; cachedLastEntryJson = "null";
+    for (int i = 0; i < MAX_LOGS; ++i) {
+      logs[i].timeText = logs[i].event = logs[i].name = "";
+      logs[i].collegeId = logs[i].role = logs[i].department = logs[i].message = "";
+      logs[i].id = -1; logs[i].seq = 0; logs[i].savedToSd = false;
+    }
+    for (int i = 0; i <= MAX_FINGERPRINTS; ++i) {
+      insideState[i] = false;
+      lastAttendanceActionMs[i] = 0;
+    }
+    cachedRegisteredJson = "[]";
+    nextEnrollID = 1; scanFirstFreeId = 1; cachedTemplateCount = 0;
+    bootSnapshotDirty = true;
+    unlockState();
+  }
+}
+
+static void serviceFactoryReset() {
+  if (factoryResetStage == 0) return;
+
+  if (factoryResetStage == 1) {
+    if (!fingerprintSensorOk || !lockFinger(1000)) return;
+    const uint8_t emptyResult = finger.emptyDatabase();
+    unlockFinger();
+    if (emptyResult != FINGERPRINT_OK) {
+      Serial.printf("[RESET] Sensor emptyDatabase failed: 0x%02X\\n", emptyResult);
+      finishFactoryResetCommand(false, "sensor_clear_failed");
+      return;
+    }
+    factoryResetSdDone = false;
+    factoryResetSdOk = false;
+    factoryResetSdRequested = true;
+    factoryResetStage = 2;
+    oledScreen("CLEAN START", "Clearing local data", "Please wait...");
+    Serial.println("[RESET] Sensor templates cleared; waiting for SD transaction.");
+    return;
+  }
+
+  if (factoryResetStage == 2 && factoryResetSdDone) {
+    if (!factoryResetSdOk) {
+      finishFactoryResetCommand(false, "sd_clear_failed");
+      return;
+    }
+    if (!clearAllTeacherProfilesAndPresence()) {
+      finishFactoryResetCommand(false, "local_profile_clear_failed");
+      return;
+    }
+    CloudSync.clearOutboxRamForFactoryReset();
+    clearFactoryResetRamState();
+    rebuildRegisteredCache();
+    refreshTemplateCountCache();
+    Serial.println("[RESET] Hardware, SD records, profiles and outbox reset; device settings preserved.");
+    finishFactoryResetCommand(true, nullptr);
+    oledScreen("RESET COMPLETE", "Ready for new", "teachers");
+    smartDelay(900);
+    oledScanScreen();
+  }
+}
+
 
 // Fail closed: a dashboard-selected fingerprint slot may only be used when the
 // sensor positively reports that the slot is empty. UART errors are not "empty".
@@ -191,6 +272,7 @@ void loop() {
   // callback only enqueues the browser epoch; loop() owns the actual write.
   serviceDeviceSetupPersistence();
   serviceBrowserTimeSync();
+  serviceFactoryReset();
 
   serviceLedBuzzerTimers();
   serviceWeekendAttendanceFeedback();
@@ -713,6 +795,21 @@ static void handleCloudCommand(const char* commandId, const char* command, const
     CloudSync.flushCommandAcks();
     requestRestart(false);
     return;
+  }
+
+  if (!strcmp(command, "factory_reset")) {
+    if (factoryResetStage != 0 || isEnrolling || !fingerprintSensorOk) {
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"device_busy_or_sensor_unavailable\"}");
+      CloudSync.flushCommandAcks();
+      return;
+    }
+    strncpy(activeFactoryResetCommandId, commandId, sizeof(activeFactoryResetCommandId) - 1);
+    activeFactoryResetCommandId[sizeof(activeFactoryResetCommandId) - 1] = '\\0';
+    factoryResetStage = 1;
+    isEnrolling = true; // suppress attendance scans while the destructive reset is running
+    oledScreen("CLEAN START", "Preparing reset", "Please wait...");
+    Serial.println("[RESET] Authorized factory_reset command accepted.");
+    return; // ACK only after sensor + SD + profile reset have all been verified
   }
 
   if (!strcmp(command, "update_settings")) {
