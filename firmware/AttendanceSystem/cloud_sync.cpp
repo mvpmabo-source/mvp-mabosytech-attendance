@@ -21,6 +21,7 @@
 #include <ArduinoJson.h>
 #include <esp_heap_caps.h>
 #include <cstring>
+#include <cstdlib>
 
 CloudSyncClass CloudSync;
 
@@ -437,11 +438,27 @@ void CloudSyncClass::sendHeartbeat(
 // ──────────────────────────────────────────────
 
 void CloudSyncClass::processHeartbeatResponse(const String& response) {
-  if (response.length() == 0) return;
+  if (response.length() == 0) {
+    Serial.println("[CLOUD] Heartbeat response body is empty; no commands can be dispatched.");
+    return;
+  }
 
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, response);
-  if (err || !(doc["ok"] | false)) return;
+  if (err) {
+    String preview = response;
+    preview.replace("\r", " ");
+    preview.replace("\n", " ");
+    if (preview.length() > 180) preview.remove(180);
+    Serial.printf("[CLOUD] Heartbeat JSON parse failed: %s body=%s\n",
+                  err.c_str(), preview.c_str());
+    return;
+  }
+  if (!(doc["ok"] | false)) {
+    Serial.printf("[CLOUD] Heartbeat response ok=false error=%s\n",
+                  (const char*)(doc["error"] | "unspecified"));
+    return;
+  }
 
   // Some cloud deployments also return the persisted device settings alongside commands.
   // Apply them through a callback so the app can validate and persist them on the main loop.
@@ -456,12 +473,20 @@ void CloudSyncClass::processHeartbeatResponse(const String& response) {
   }
 
   JsonArray cmds = doc["pending_commands"].as<JsonArray>();
-  if (cmds.isNull()) return;
+  if (cmds.isNull()) {
+    Serial.println("[CLOUD] Heartbeat JSON has no pending_commands array.");
+    return;
+  }
+  Serial.printf("[CLOUD] Heartbeat accepted; pending commands received=%u\n",
+                (unsigned)cmds.size());
 
   for (JsonObject cmd : cmds) {
     String id = cmd["id"].as<String>();
     const char* command = cmd["command"] | "";
-    if (!id.length() || !command[0]) continue;
+    if (!id.length() || !command[0]) {
+      Serial.println("[CLOUD] Ignoring malformed pending command (missing id or command).");
+      continue;
+    }
 
     int slot = -1;
     for (int i = 0; i < _pendingAckCount; i++) {
@@ -792,55 +817,168 @@ bool CloudSyncClass::postJson(const String& body, String* responseOut, int* http
   _tls.print("Connection: close\r\n\r\n");
   _tls.print(body);
 
-  // Read the HTTP response status line
+  // Parse status/headers explicitly, then consume the response according to
+  // HTTP framing. Supabase/Edge gateways may return chunked bodies; feeding
+  // chunk markers to ArduinoJson silently prevented heartbeat commands reaching
+  // the callback even though the heartbeat itself was stored successfully.
+  _tls.setTimeout(1000);
   bool ok = false;
+  bool chunked = false;
+  long contentLength = -1;
   int httpStatus = 0;
-  bool headersDone = false;
   unsigned long deadline = millis() + CLOUD_TIMEOUT_MS;
+  const size_t MAX_RESPONSE_BYTES = 8192;
   String responseBody;
-  responseBody.reserve(512);
+  responseBody.reserve(768);
 
-  while (_tls.connected() && millis() < deadline) {
-    String line = _tls.readStringUntil('\n');
-
-    // Parse the status line: "HTTP/1.1 200 OK"
-    if (line.startsWith("HTTP/1.") && line.length() > 12) {
-      int spaceIdx = line.indexOf(' ');
-      if (spaceIdx >= 0) {
-        String statusStr = line.substring(spaceIdx + 1, spaceIdx + 4);
-        httpStatus = statusStr.toInt();
-        ok = (httpStatus == 200);
-      }
+  String statusLine = _tls.readStringUntil('\n');
+  statusLine.trim();
+  if (statusLine.startsWith("HTTP/")) {
+    const int spaceIdx = statusLine.indexOf(' ');
+    if (spaceIdx >= 0 && statusLine.length() >= (unsigned)(spaceIdx + 4)) {
+      httpStatus = statusLine.substring(spaceIdx + 1, spaceIdx + 4).toInt();
+      ok = (httpStatus == 200);
     }
+  } else {
+    Serial.printf("[CLOUD] HTTP status line malformed: %s\n",
+                  statusLine.length() ? statusLine.c_str() : "(empty)");
+  }
 
-    // Detect end of headers
-    if (line == "\r" || line.length() == 0) {
+  // Read headers through the first blank line.
+  bool headersDone = false;
+  while (_tls.connected() && (long)(deadline - millis()) > 0) {
+    String header = _tls.readStringUntil('\n');
+    header.trim();
+    if (header.length() == 0) {
       headersDone = true;
-      continue;
+      break;
     }
 
-    // Read body (after headers)
-    if (headersDone) {
-      responseBody += line;
-      // Also try reading raw bytes if available (some servers don't use newlines)
-      while (_tls.available() && millis() < deadline) {
-        int c = _tls.read();
-        if (c >= 0) responseBody += (char)c;
+    const int colon = header.indexOf(':');
+    if (colon <= 0) continue;
+    String key = header.substring(0, colon);
+    String value = header.substring(colon + 1);
+    key.trim();
+    value.trim();
+    key.toLowerCase();
+    value.toLowerCase();
+
+    if (key == "transfer-encoding" && value.indexOf("chunked") >= 0) {
+      chunked = true;
+    } else if (key == "content-length") {
+      const long parsedLength = value.toInt();
+      if (parsedLength >= 0) contentLength = parsedLength;
+    }
+  }
+
+  // Wait briefly for one byte without blocking forever on a stalled server.
+  auto readResponseByte = [&]() -> int {
+    while (!_tls.available() && _tls.connected() && (long)(deadline - millis()) > 0) {
+      delay(1);
+    }
+    return _tls.available() ? _tls.read() : -1;
+  };
+
+  bool bodyReadOk = headersDone;
+  if (!headersDone) {
+    Serial.println("[CLOUD] HTTP response headers were incomplete.");
+    bodyReadOk = false;
+  } else if (chunked) {
+    // Decode chunked transfer encoding before exposing JSON to callers.
+    while ((long)(deadline - millis()) > 0) {
+      String sizeLine = _tls.readStringUntil('\n');
+      sizeLine.trim();
+      if (sizeLine.length() == 0) continue;
+
+      const int extension = sizeLine.indexOf(';');
+      if (extension >= 0) sizeLine.remove(extension);
+      sizeLine.trim();
+      char* endPtr = nullptr;
+      const unsigned long chunkSize = strtoul(sizeLine.c_str(), &endPtr, 16);
+      if (endPtr == sizeLine.c_str() || !endPtr || *endPtr != '\0' ||
+          chunkSize > MAX_RESPONSE_BYTES ||
+          responseBody.length() + chunkSize > MAX_RESPONSE_BYTES) {
+        Serial.println("[CLOUD] Invalid/oversized chunked HTTP response.");
+        bodyReadOk = false;
+        break;
       }
+
+      if (chunkSize == 0) {
+        // Consume optional trailers; they are not part of the JSON body.
+        while (_tls.connected() && (long)(deadline - millis()) > 0) {
+          String trailer = _tls.readStringUntil('\n');
+          trailer.trim();
+          if (trailer.length() == 0) break;
+        }
+        break;
+      }
+
+      for (unsigned long i = 0; i < chunkSize; ++i) {
+        const int ch = readResponseByte();
+        if (ch < 0) {
+          bodyReadOk = false;
+          break;
+        }
+        responseBody += (char)ch;
+      }
+      if (!bodyReadOk) break;
+
+      const int cr = readResponseByte();
+      const int lf = readResponseByte();
+      if (cr != '\r' || lf != '\n') {
+        Serial.println("[CLOUD] Chunk terminator malformed.");
+        bodyReadOk = false;
+        break;
+      }
+    }
+  } else if (contentLength >= 0) {
+    if ((unsigned long)contentLength > MAX_RESPONSE_BYTES) {
+      Serial.printf("[CLOUD] HTTP response too large: %ld bytes\n", contentLength);
+      bodyReadOk = false;
+    } else {
+      for (long i = 0; i < contentLength; ++i) {
+        const int ch = readResponseByte();
+        if (ch < 0) {
+          bodyReadOk = false;
+          break;
+        }
+        responseBody += (char)ch;
+      }
+    }
+  } else {
+    // Close-delimited fallback for servers which omit Content-Length.
+    while ((long)(deadline - millis()) > 0 && (_tls.connected() || _tls.available())) {
+      const int ch = readResponseByte();
+      if (ch < 0) {
+        if (!_tls.connected()) break;
+        continue;
+      }
+      if (responseBody.length() >= MAX_RESPONSE_BYTES) {
+        Serial.println("[CLOUD] HTTP response exceeded safety limit.");
+        bodyReadOk = false;
+        break;
+      }
+      responseBody += (char)ch;
     }
   }
 
   _tls.stop();
+  responseBody.trim();
 
   if (httpStatusOut) *httpStatusOut = httpStatus;
-
-  // Keep the response body available for diagnosing HTTP 401/403/404 errors.
   if (responseOut) *responseOut = responseBody;
-  if (!ok) {
+
+  Serial.printf("[CLOUD] HTTP response status=%d bytes=%u framing=%s bodyOK=%s\n",
+                httpStatus, (unsigned int)responseBody.length(),
+                chunked ? "chunked" : (contentLength >= 0 ? "content-length" : "close"),
+                bodyReadOk ? "yes" : "no");
+
+  if (!ok || !bodyReadOk) {
     String preview = responseBody;
-    preview.replace("\r", " "); preview.replace("\n", " ");
+    preview.replace("\r", " ");
+    preview.replace("\n", " ");
     if (preview.length() > 180) preview.remove(180);
-    Serial.printf("[CLOUD] HTTP status %d (not 200); response=%s\n",
+    Serial.printf("[CLOUD] HTTP request failed status=%d response=%s\n",
                   httpStatus, preview.length() ? preview.c_str() : "(empty)");
     return false;
   }
