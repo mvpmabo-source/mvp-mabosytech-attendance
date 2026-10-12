@@ -492,32 +492,43 @@ void CloudSyncClass::processHeartbeatResponse(const String& response) {
     for (int i = 0; i < _pendingAckCount; i++) {
       if (strcmp(_pendingAcks[i].id, id.c_str()) == 0) { slot = i; break; }
     }
-    if (slot < 0) {
-      if (_pendingAckCount >= CLOUD_MAX_PENDING_CMDS) {
-        Serial.println("[CLOUD] Command queue full; command left pending on server.");
-        continue;
-      }
-      slot = _pendingAckCount++;
-      memset(&_pendingAcks[slot], 0, sizeof(_pendingAcks[slot]));
-      strncpy(_pendingAcks[slot].id, id.c_str(), sizeof(_pendingAcks[slot].id)-1);
-      strncpy(_pendingAcks[slot].command, command, sizeof(_pendingAcks[slot].command)-1);
-      JsonVariantConst payload = cmd["payload"];
-      if (!payload.isNull()) {
-        String payloadStr;
-        serializeJson(payload, payloadStr);
-        strncpy(_pendingAcks[slot].payload, payloadStr.c_str(), sizeof(_pendingAcks[slot].payload)-1);
-      } else {
-        strcpy(_pendingAcks[slot].payload, "{}");
-      }
-      _pendingAcks[slot].ackReady = false;
-      _pendingAcks[slot].succeeded = false;
-      Serial.printf("[CLOUD] Command received id=%s type=%s\n", id.c_str(), command);
-      if (_commandCallback) {
-        _commandCallback(_pendingAcks[slot].id, _pendingAcks[slot].command, _pendingAcks[slot].payload);
-      } else {
-        completeCommand(id.c_str(), false, "{\"error\":\"No command handler registered\"}");
-      }
+    // Execute strictly one command per heartbeat. Enrollment is a long-running
+    // sensor operation; dispatching a following restart in the same response
+    // reboots the ESP before the OLED can enter enrollment mode.
+    if (slot >= 0) {
+      Serial.printf("[CLOUD] First pending command %s is still in flight; deferring later commands.\n",
+                    id.c_str());
+      break;
     }
+
+    if (_pendingAckCount >= CLOUD_MAX_PENDING_CMDS) {
+      Serial.println("[CLOUD] Command queue full; command left pending on server.");
+      break;
+    }
+
+    slot = _pendingAckCount++;
+    memset(&_pendingAcks[slot], 0, sizeof(_pendingAcks[slot]));
+    strncpy(_pendingAcks[slot].id, id.c_str(), sizeof(_pendingAcks[slot].id)-1);
+    strncpy(_pendingAcks[slot].command, command, sizeof(_pendingAcks[slot].command)-1);
+    JsonVariantConst payload = cmd["payload"];
+    if (!payload.isNull()) {
+      String payloadStr;
+      serializeJson(payload, payloadStr);
+      strncpy(_pendingAcks[slot].payload, payloadStr.c_str(), sizeof(_pendingAcks[slot].payload)-1);
+    } else {
+      strcpy(_pendingAcks[slot].payload, "{}");
+    }
+    _pendingAcks[slot].ackReady = false;
+    _pendingAcks[slot].succeeded = false;
+    Serial.printf("[CLOUD] Command received id=%s type=%s\n", id.c_str(), command);
+    if (_commandCallback) {
+      _commandCallback(_pendingAcks[slot].id, _pendingAcks[slot].command, _pendingAcks[slot].payload);
+    } else {
+      completeCommand(id.c_str(), false, "{\"error\":\"No command handler registered\"}");
+    }
+    // The first command may still be running (e.g. enrollment). Never dispatch
+    // another command from this response, even if its handler returns quickly.
+    break;
   }
 }
 
