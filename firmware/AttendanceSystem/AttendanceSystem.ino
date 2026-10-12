@@ -1,6 +1,10 @@
 #include "app.h"
 #include <esp_system.h>
 #include "mbedtls/sha256.h"
+#include <ArduinoJson.h>
+
+static void handleCloudCommand(const char* commandId, const char* command, const char* payload);
+static char activeCloudEnrollCommandId[40] = "";
 
 void setup() {
   Serial.begin(115200);
@@ -135,6 +139,7 @@ void setup() {
   if (fingerprintSensorOk) fpSetLed(true);
 
   CloudSync.begin(CLOUD_DEVICE_ID, CLOUD_API_KEY);
+  CloudSync.onCommand(handleCloudCommand);
   if (CloudSync.isEnabled())
     addLog("INFO", -1, "Cloud sync enabled");
   else
@@ -241,6 +246,7 @@ void loop() {
       bool wasCancelled=false, wasDuplicate=false;
       if (lockState()) { wasCancelled=cancelEnroll; wasDuplicate=duplicateFound; unlockState(); }
 
+      bool cloudEnrollSucceeded = false;
       if (wasCancelled) {
         addLog("CANCEL", -1, "Enrollment cancelled");
         oledBig("CANCELLED", "Back to scan"); smartDelay(1000);
@@ -277,6 +283,7 @@ void loop() {
           addLog("ERROR", -1, "Fingerprint slot scan failed after enrollment; no slot will be reused until the sensor is rescanned.");
         }
         refreshTemplateCountCache();
+        cloudEnrollSucceeded = true;
       } else {
         addLog("ERROR", -1, "Enrollment failed");
         oledErrorAnimation("Not saved", "Try again");
@@ -286,6 +293,13 @@ void loop() {
         pendingName=pendingCollegeId=pendingRole=pendingDepartment=pendingNote="";
         isEnrolling=false; cancelEnroll=false; duplicateFound=false;
         unlockState();
+      }
+      if (activeCloudEnrollCommandId[0]) {
+        CloudSync.completeCommand(activeCloudEnrollCommandId, cloudEnrollSucceeded,
+          cloudEnrollSucceeded ? "{\"ok\":true,\"message\":\"fingerprint_enrolled\"}" :
+                                 "{\"ok\":false,\"error\":\"enrollment_failed_or_cancelled\"}");
+        activeCloudEnrollCommandId[0] = '\0';
+        CloudSync.flushCommandAcks();
       }
       fpWake();   // restart the idle timer after enrollment
       oledScanScreen();
@@ -448,4 +462,117 @@ void servicePendingRestart() {
   if (!pendingRestart || (long)(millis()-pendingRestartAtMs) < 0) return;
   pendingRestart=false;
   ESP.restart();
+}
+
+
+static void handleCloudCommand(const char* commandId, const char* command, const char* payload) {
+  if (!commandId || !command || !command[0]) return;
+  JsonDocument data;
+  if (payload && payload[0]) {
+    DeserializationError err = deserializeJson(data, payload);
+    if (err) {
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"invalid_payload_json\"}");
+      return;
+    }
+  }
+
+  if (!strcmp(command, "sync_time")) {
+    uint32_t epoch = data["epoch"] | (data["unix_epoch"] | (data["timestamp"] | 0UL));
+    bool ok = epoch >= 1704067200UL && syncRTCFromBrowserEpoch(epoch);
+    CloudSync.completeCommand(commandId, ok,
+      ok ? "{\"ok\":true,\"message\":\"rtc_synced\"}" :
+           "{\"ok\":false,\"error\":\"invalid_epoch_or_rtc_sync_failed\"}");
+    CloudSync.flushCommandAcks();
+    return;
+  }
+
+  if (!strcmp(command, "restart")) {
+    CloudSync.completeCommand(commandId, true, "{\"ok\":true,\"message\":\"restart_scheduled\"}");
+    CloudSync.flushCommandAcks();
+    requestRestart(false);
+    return;
+  }
+
+  if (!strcmp(command, "update_settings")) {
+    bool changed = false;
+    const char* checkin = data["checkin_time"] | "";
+    const char* checkout = data["checkout_time"] | "";
+    const char* name = data["device_name"] | "";
+    if (checkin[0]) {
+      int mins = hhmmToMinutes(String(checkin));
+      if (mins < 0 || mins >= 1440) {
+        CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"invalid_checkin_time\"}");
+        CloudSync.flushCommandAcks(); return;
+      }
+      cfgCheckinMinutes = mins; changed = true;
+    }
+    if (checkout[0]) {
+      int mins = hhmmToMinutes(String(checkout));
+      if (mins < 0 || mins >= 1440) {
+        CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"invalid_checkout_time\"}");
+        CloudSync.flushCommandAcks(); return;
+      }
+      cfgCheckoutMinutes = mins; changed = true;
+    }
+    if (name[0]) { cfgDeviceName = String(name); changed = true; }
+    if (changed) deviceSetupPersistPending = true;
+    CloudSync.completeCommand(commandId, changed,
+      changed ? "{\"ok\":true,\"message\":\"settings_applied\"}" :
+                "{\"ok\":false,\"error\":\"no_supported_settings_in_payload\"}");
+    CloudSync.flushCommandAcks();
+    return;
+  }
+
+  if (!strcmp(command, "enroll_fingerprint") || !strcmp(command, "enroll")) {
+    if (!fingerprintSensorOk || isEnrolling || dashboardEnrollRequest || activeCloudEnrollCommandId[0]) {
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"sensor_unavailable_or_enrollment_busy\"}");
+      CloudSync.flushCommandAcks(); return;
+    }
+    String name = data["name"] | "";
+    String college = data["college_id"] | "";
+    String role = data["role"] | "teacher";
+    String department = data["department"] | "";
+    String note = data["note"] | "";
+    if (!name.length()) {
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"teacher_name_required\"}");
+      CloudSync.flushCommandAcks(); return;
+    }
+    if (!lockState()) {
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"state_lock_unavailable\"}");
+      CloudSync.flushCommandAcks(); return;
+    }
+    pendingName = name; pendingCollegeId = college; pendingRole = role;
+    pendingDepartment = department; pendingNote = note;
+    dashboardEnrollRequest = true;
+    strncpy(activeCloudEnrollCommandId, commandId, sizeof(activeCloudEnrollCommandId)-1);
+    activeCloudEnrollCommandId[sizeof(activeCloudEnrollCommandId)-1] = '\0';
+    unlockState();
+    Serial.printf("[CLOUD] Enrollment queued for %s\n", name.c_str());
+    return; // acknowledge only after sensor enrollment really finishes
+  }
+
+  if (!strcmp(command, "delete_fingerprint") || !strcmp(command, "delete_fingerprint_template")) {
+    int id = data["fingerprint_id"] | (data["template_id"] | 0);
+    if (id < 1 || id > MAX_FINGERPRINTS || !fingerprintSensorOk || !lockFinger(100)) {
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"invalid_id_sensor_unavailable_or_busy\"}");
+      CloudSync.flushCommandAcks(); return;
+    }
+    uint8_t result = finger.deleteModel(id);
+    unlockFinger();
+    if (result == FINGERPRINT_OK) {
+      deleteProfile((uint16_t)id);
+      clearPresenceState((uint16_t)id);
+      removeRegisteredEntry((uint16_t)id);
+      refreshTemplateCountCache();
+      if (nextEnrollID == 0 || id < nextEnrollID) nextEnrollID = (uint16_t)id;
+      CloudSync.completeCommand(commandId, true, "{\"ok\":true,\"message\":\"fingerprint_deleted\"}");
+    } else {
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"sensor_delete_failed\"}");
+    }
+    CloudSync.flushCommandAcks();
+    return;
+  }
+
+  CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"unsupported_command\"}");
+  CloudSync.flushCommandAcks();
 }
