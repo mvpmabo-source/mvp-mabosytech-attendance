@@ -383,9 +383,10 @@ void loop() {
   // ---- Cloud sync (non-blocking) ----
   CloudSync.loop();
 
-  // Send a heartbeat every ~60s with current device telemetry.
+  // Poll cloud commands and refresh device presence every ~15s. This keeps
+  // dashboard actions responsive without issuing a heartbeat on every loop.
   static unsigned long lastCloudHb = 0;
-  if (CloudSync.isEnabled() && millis() - lastCloudHb >= 60000UL) {
+  if (CloudSync.isEnabled() && millis() - lastCloudHb >= 15000UL) {
     lastCloudHb = millis();
     struct tm tm;
     bool haveTime = getCurrentDateTime(tm);
