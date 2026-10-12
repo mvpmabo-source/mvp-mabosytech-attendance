@@ -48,7 +48,8 @@ void CloudSyncClass::begin(const char* deviceId, const char* apiKey) {
   // previously failed with MBEDTLS_ERR_X509_ALLOC_FAILED on this device.
   // Certificate-chain validation remains enabled; never use setInsecure().
   _tls.useBuiltinCACertBundle();
-  Serial.println("[CLOUD] Built-in CA bundle enabled; TLS verification remains ON.");}
+  Serial.println("[CLOUD] Built-in CA bundle enabled; TLS verification remains ON.");
+}
 
 // ──────────────────────────────────────────────
 // Event UID generation
