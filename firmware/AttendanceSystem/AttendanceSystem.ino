@@ -593,17 +593,17 @@ static void handleCloudSettings(const char* settingsJson) {
   JsonDocument settings;
   DeserializationError err = deserializeJson(settings, settingsJson);
   if (err) {
-    Serial.printf("[CLOUD] Ignoring malformed heartbeat settings: %s\\n", err.c_str());
+    Serial.printf("[CLOUD] Ignoring malformed heartbeat settings: %s\n", err.c_str());
     return;
   }
 
   bool changed = false;
   String error;
   if (!applyCloudSettingsDocument(settings, changed, error)) {
-    Serial.printf("[CLOUD] Heartbeat settings not applied: %s\\n", error.c_str());
+    Serial.printf("[CLOUD] Heartbeat settings not applied: %s\n", error.c_str());
     return;
   }
-  Serial.printf("[CLOUD] Heartbeat settings processed; changed=%s\\n", changed ? "yes" : "no");
+  Serial.printf("[CLOUD] Heartbeat settings processed; changed=%s\n", changed ? "yes" : "no");
 }
 
 static void handleCloudCommand(const char* commandId, const char* command, const char* payload) {
