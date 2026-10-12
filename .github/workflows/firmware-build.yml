@@ -1,5 +1,9 @@
 name: ESP32 firmware build
 
+concurrency:
+  group: firmware-build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
     branches: [phase-3-firmware-cloud-sync]
