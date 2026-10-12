@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo, useCallback } from "react";
+import { useEffect, useState, useMemo, useCallback, type FormEvent } from "react";
 import { Users, Search, LogIn, LogOut, Trash2, RefreshCw, UserPlus } from "lucide-react";
 import { supabase, type AttendanceEvent } from "@/lib/supabase";
 import { Card, LoadingSpinner, EmptyState, ErrorState, Badge } from "@/components/ui";
@@ -65,7 +65,7 @@ export function PeoplePage() {
     return () => clearInterval(interval);
   }, [load]);
 
-  async function queueEnrollment(event: React.FormEvent<HTMLFormElement>) {
+  async function queueEnrollment(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!newTeacher.name.trim()) { setError("Teacher name is required."); return; }
     setEnrollBusy(true); setError(null); setNotice(null);
