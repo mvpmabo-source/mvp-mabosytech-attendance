@@ -265,10 +265,10 @@ void loop() {
     // Dashboard records can contain a stale/occupied slot number. Never overwrite it:
     // automatically pick a positively verified empty sensor slot instead.
     if (requestedCloudTargetId > 0 && requestedSlotStatus == FINGERPRINT_OK) {
-      Serial.printf("[CLOUD] Requested fingerprint slot %u is occupied; searching for a free slot.\\n", (unsigned)targetId);
+      Serial.printf("[CLOUD] Requested fingerprint slot %u is occupied; searching for a free slot.\n", (unsigned)targetId);
       const uint16_t fallbackId = findNextFreeFrom(1);
       if (fallbackId >= 1 && fallbackId <= MAX_FINGERPRINTS) {
-        Serial.printf("[CLOUD] Using verified free fingerprint slot %u instead.\\n", (unsigned)fallbackId);
+        Serial.printf("[CLOUD] Using verified free fingerprint slot %u instead.\n", (unsigned)fallbackId);
         targetId = fallbackId;
         requestedCloudTargetId = 0;
         requestedSlotStatus = CLOUD_FP_SLOT_EMPTY_CODE;
