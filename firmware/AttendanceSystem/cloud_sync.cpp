@@ -19,6 +19,8 @@
 #include "cloud_sync.h"
 #include "app.h"
 #include <ArduinoJson.h>
+#include <esp_heap_caps.h>
+#include <cstring>
 
 CloudSyncClass CloudSync;
 
@@ -175,17 +177,21 @@ bool CloudSyncClass::persistOutboxItem(const CloudOutboxItem& item) {
 bool CloudSyncClass::compactOutboxFile() {
   if (!sdAvailable || !lockCloudSd(1000)) return false;
 
-  // Preserve the current file as a backup before replacing it. The live file
-  // is never truncated. Recovery prefers a valid live file, then temp, then backup.
+  // Write the active in-RAM window to a temp file. The SD outbox may contain
+  // additional records that intentionally do not fit in RAM; preserve those
+  // raw rows instead of dropping them during compaction.
   SD.remove(CLOUD_OUTBOX_TMP_FILE);
   File tmp = SD.open(CLOUD_OUTBOX_TMP_FILE, FILE_WRITE);
   if (!tmp) { unlockCloudSd(); return false; }
+
   const String header = String(CLOUD_OUTBOX_HEADER) + "\n";
   size_t expectedBytes = header.length();
   bool ok = tmp.write((const uint8_t*)header.c_str(), header.length()) == header.length();
+
   for (int i = 0; ok && i < _outboxCount; i++) {
     const CloudOutboxItem& item = _outbox[i];
     if (item.uploaded) continue;
+
     char eventUid[48];
     generateEventUid(eventUid, sizeof(eventUid), item.date, item.timeStr, item.fingerprintId);
     String row;
@@ -198,13 +204,67 @@ bool CloudSyncClass::compactOutboxFile() {
     row += csvEscape(String(item.department)); row += ",";
     row += item.eventType; row += ","; row += item.status; row += ",";
     row += String(item.retryCount); row += ","; row += String(item.nextAttempt); row += "\n";
-    ok = tmp.write((const uint8_t*)row.c_str(), row.length()) == row.length();
-    expectedBytes += row.length();
+    const size_t rowBytes = row.length();
+    ok = tmp.write((const uint8_t*)row.c_str(), rowBytes) == rowBytes;
+    expectedBytes += rowBytes;
   }
   tmp.flush();
   tmp.close();
 
-  // Verify the candidate can be read and has a valid header before promotion.
+  // Preserve rows from the old SD file that are not represented in RAM.
+  // Entries marked uploaded are still represented in RAM at compaction time,
+  // so they are intentionally omitted from the replacement file.
+  if (ok && SD.exists(CLOUD_OUTBOX_FILE)) {
+    File existing = SD.open(CLOUD_OUTBOX_FILE, FILE_READ);
+    if (!existing) {
+      ok = false;
+    } else {
+      String oldHeader = existing.readStringUntil('\n');
+      if (oldHeader != CLOUD_OUTBOX_HEADER) ok = false;
+
+      File append = ok ? SD.open(CLOUD_OUTBOX_TMP_FILE, FILE_APPEND) : File();
+      if (ok && !append) ok = false;
+
+      while (ok && existing.available()) {
+        String rawRow = existing.readStringUntil('\n');
+        if (rawRow.length() == 0) continue;
+
+        bool representedInRam = false;
+        const int comma = rawRow.indexOf(',');
+        if (comma > 0) {
+          for (int i = 0; i < _outboxCount; i++) {
+            char eventUid[48];
+            generateEventUid(eventUid, sizeof(eventUid),
+                             _outbox[i].date, _outbox[i].timeStr, _outbox[i].fingerprintId);
+            const size_t uidLen = strlen(eventUid);
+            if (uidLen == (size_t)comma &&
+                strncmp(rawRow.c_str(), eventUid, uidLen) == 0) {
+              representedInRam = true;
+              break;
+            }
+          }
+        }
+
+        if (representedInRam) continue;
+
+        const size_t rowBytes = rawRow.length();
+        if (append.write((const uint8_t*)rawRow.c_str(), rowBytes) != rowBytes ||
+            append.write((const uint8_t*)"\n", 1) != 1) {
+          ok = false;
+          break;
+        }
+        expectedBytes += rowBytes + 1;
+      }
+
+      if (append) {
+        append.flush();
+        append.close();
+      }
+      existing.close();
+    }
+  }
+
+  // Verify the complete candidate before promoting it over the live file.
   File verify = ok ? SD.open(CLOUD_OUTBOX_TMP_FILE, FILE_READ) : File();
   if (!verify) ok = false;
   if (verify) {
@@ -213,6 +273,7 @@ bool CloudSyncClass::compactOutboxFile() {
     if (gotHeader != CLOUD_OUTBOX_HEADER) ok = false;
     verify.close();
   }
+
   if (ok) {
     SD.remove(CLOUD_OUTBOX_BACKUP_FILE);
     if (SD.exists(CLOUD_OUTBOX_FILE) && !SD.rename(CLOUD_OUTBOX_FILE, CLOUD_OUTBOX_BACKUP_FILE)) ok = false;
@@ -221,6 +282,7 @@ bool CloudSyncClass::compactOutboxFile() {
       ok = false;
     }
   }
+
   unlockCloudSd();
   if (!ok) Serial.println("[CLOUD] Outbox compaction failed; original/backup retained for recovery.");
   return ok;
@@ -331,7 +393,9 @@ void CloudSyncClass::sendHeartbeat(
   // Send any pending command acks first
   sendCommandAcks();
 
-  JsonDocument doc;
+  String body;
+  {
+    JsonDocument doc;
   doc["type"] = "heartbeat";
   doc["device_id"] = _deviceId;
   doc["api_key"] = _apiKey;
@@ -356,8 +420,8 @@ void CloudSyncClass::sendHeartbeat(
   hb["is_enrolling"] = isEnrolling;
   hb["fingerprint_ok"] = fpOk;
 
-  String body;
-  serializeJson(doc, body);
+    serializeJson(doc, body);
+  }
 
   String response;
   int httpStatus = 0;
@@ -459,7 +523,9 @@ void CloudSyncClass::sendCommandAcks() {
       writeIndex++;
       continue;
     }
-    JsonDocument doc;
+    String body;
+    {
+      JsonDocument doc;
     doc["type"] = "ack_command";
     doc["device_id"] = _deviceId;
     doc["api_key"] = _apiKey;
@@ -472,8 +538,8 @@ void CloudSyncClass::sendCommandAcks() {
       doc["result"] = _pendingAcks[i].result;
     }
 
-    String body;
-    serializeJson(doc, body);
+      serializeJson(doc, body);
+    }
     int status = 0;
     if (postJson(body, nullptr, &status) && status >= 200 && status < 300) {
       Serial.printf("[CLOUD] Command ack sent id=%s status=%s\n", _pendingAcks[i].id,
@@ -507,6 +573,28 @@ void CloudSyncClass::loop() {
 // ──────────────────────────────────────────────
 
 void CloudSyncClass::processOutbox() {
+  // If a server-confirmed batch could not be compacted earlier, retry the SD
+  // transaction before reusing its RAM slots.
+  bool hasConfirmedInRam = false;
+  for (int i = 0; i < _outboxCount; i++) {
+    if (_outbox[i].uploaded) { hasConfirmedInRam = true; break; }
+  }
+  if (hasConfirmedInRam) {
+    if (compactOutboxFile()) {
+      int newCount = 0;
+      for (int i = 0; i < _outboxCount; i++) {
+        if (_outbox[i].uploaded) continue;
+        if (newCount != i) _outbox[newCount] = _outbox[i];
+        newCount++;
+      }
+      _outboxCount = newCount;
+    } else {
+      Serial.println("[CLOUD] Confirmed items retained in RAM until SD compaction succeeds.");
+    }
+  }
+
+  // Refill this bounded RAM window from the durable SD outbox as capacity opens.
+  if (sdAvailable && _outboxCount < CLOUD_OUTBOX_MAX) loadOutboxFromSD();
   if (_outboxCount == 0) return;
 
   unsigned long now = millis();
@@ -535,7 +623,9 @@ void CloudSyncClass::processOutbox() {
   if (eligibleCount == 0) return;
 
   // Build the batch JSON payload
-  JsonDocument doc;
+  String body;
+  {
+    JsonDocument doc;
   doc["type"] = "batch";
   doc["device_id"] = _deviceId;
   doc["api_key"] = _apiKey;
@@ -558,8 +648,8 @@ void CloudSyncClass::processOutbox() {
     evt["status"] = item.status;
   }
 
-  String body;
-  serializeJson(doc, body);
+    serializeJson(doc, body);
+  }
 
   String response;
   int httpStatus = 0;
@@ -587,20 +677,19 @@ void CloudSyncClass::processOutbox() {
         _outbox[eligibleIdx[j]].uploaded = true;
       }
 
-      // Compact the outbox array (remove uploaded items)
-      int newCount = 0;
-      for (int i = 0; i < _outboxCount; i++) {
-        if (!_outbox[i].uploaded) {
-          if (newCount != i) {
-            _outbox[newCount] = _outbox[i];
-          }
+      // Commit acknowledged UID removal to SD before releasing RAM slots.
+      if (compactOutboxFile()) {
+        int newCount = 0;
+        for (int i = 0; i < _outboxCount; i++) {
+          if (_outbox[i].uploaded) continue;
+          if (newCount != i) _outbox[newCount] = _outbox[i];
           newCount++;
         }
+        _outboxCount = newCount;
+        if (sdAvailable && _outboxCount < CLOUD_OUTBOX_MAX) loadOutboxFromSD();
+      } else {
+        Serial.println("[CLOUD] Batch accepted; confirmed items retained until SD compaction succeeds.");
       }
-      _outboxCount = newCount;
-
-      // Rewrite the SD outbox file to remove confirmed events
-      compactOutboxFile();
 
       Serial.printf("[CLOUD] Batch upload confirmed: %d events accepted.\n", acceptedCount);
     } else {
@@ -634,27 +723,48 @@ bool CloudSyncClass::postJson(const String& body, String* responseOut, int* http
   // TLS handshakes require a large contiguous internal-RAM allocation.
   // Log both total and largest-block heap to distinguish low memory from
   // fragmentation without weakening certificate verification.
-  Serial.printf("[CLOUD] TLS preflight heap=%u maxAlloc=%u minFree=%u\n",
+  Serial.printf("[CLOUD] TLS preflight heap=%u maxAlloc=%u minFree=%u internalFree=%u internalMaxAlloc=%u\n",
                 (unsigned int)ESP.getFreeHeap(),
                 (unsigned int)ESP.getMaxAllocHeap(),
-                (unsigned int)ESP.getMinFreeHeap());
+                (unsigned int)ESP.getMinFreeHeap(),
+                (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 
-  // Parse the URL to extract host and path
-  String url = CLOUD_BASE_URL;
-  url.replace("https://", "");
-  int pathIdx = url.indexOf('/');
-  String host = pathIdx >= 0 ? url.substring(0, pathIdx) : url;
-  String path = pathIdx >= 0 ? url.substring(pathIdx) : "/";
+  // Parse the URL into stack buffers to avoid allocating temporary Strings
+  // immediately before mbedTLS performs RSA/X.509 verification.
+  const char* baseUrl = CLOUD_BASE_URL;
+  if (strncmp(baseUrl, "https://", 8) != 0) {
+    Serial.println("[CLOUD] TLS URL rejected: HTTPS is required.");
+    if (httpStatusOut) *httpStatusOut = 0;
+    return false;
+  }
+  const char* hostStart = baseUrl + 8;
+  const char* pathStart = strchr(hostStart, '/');
+  const size_t hostLen = pathStart ? (size_t)(pathStart - hostStart) : strlen(hostStart);
+  char host[128];
+  char path[192];
+  if (hostLen == 0 || hostLen >= sizeof(host) ||
+      (pathStart && strlen(pathStart) >= sizeof(path))) {
+    Serial.println("[CLOUD] TLS URL rejected: host/path is too long or empty.");
+    if (httpStatusOut) *httpStatusOut = 0;
+    return false;
+  }
+  memcpy(host, hostStart, hostLen);
+  host[hostLen] = '\0';
+  if (pathStart) memcpy(path, pathStart, strlen(pathStart) + 1);
+  else strcpy(path, "/");
 
   // Connect with TLS certificate validation (no setInsecure)
-  if (!_tls.connect(host.c_str(), 443, CLOUD_TIMEOUT_MS)) {
+  if (!_tls.connect(host, 443, CLOUD_TIMEOUT_MS)) {
     char tlsError[160] = {0};
     const int tlsErrorCode = _tls.lastError(tlsError, sizeof(tlsError));
-    Serial.printf("[CLOUD] TLS connection failed: code=%d detail=%s heap=%u maxAlloc=%u minFree=%u\n",
+    Serial.printf("[CLOUD] TLS connection failed: code=%d detail=%s heap=%u maxAlloc=%u minFree=%u internalFree=%u internalMaxAlloc=%u\n",
                   tlsErrorCode, tlsError[0] ? tlsError : "(no TLS detail)",
                   (unsigned int)ESP.getFreeHeap(),
                   (unsigned int)ESP.getMaxAllocHeap(),
-                  (unsigned int)ESP.getMinFreeHeap());
+                  (unsigned int)ESP.getMinFreeHeap(),
+                  (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT))
     if (httpStatusOut) *httpStatusOut = 0;
     return false;
   }
@@ -671,7 +781,7 @@ bool CloudSyncClass::postJson(const String& body, String* responseOut, int* http
     "Host: %s\r\n"
     "Content-Type: application/json\r\n"
     "Content-Length: %d\r\n",
-    path.c_str(), host.c_str(), (int)body.length()
+    path, host, (int)body.length()
   );
   // Optional public/anon key for the managed function gateway. The device
   // API key remains in the JSON body and is validated server-side.
