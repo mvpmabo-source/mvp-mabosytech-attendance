@@ -6,6 +6,18 @@
 static void handleCloudCommand(const char* commandId, const char* command, const char* payload);
 static void handleCloudSettings(const char* settingsJson);
 static char activeCloudEnrollCommandId[40] = "";
+static uint16_t pendingCloudEnrollTargetId = 0;
+static constexpr uint8_t CLOUD_FP_SLOT_EMPTY_CODE = 0x0C;
+
+// Fail closed: a dashboard-selected fingerprint slot may only be used when the
+// sensor positively reports that the slot is empty. UART errors are not "empty".
+static uint8_t cloudFingerprintSlotStatus(uint16_t id) {
+  if (id < 1 || id > MAX_FINGERPRINTS) return 0xFF;
+  if (!lockFinger(500)) return 0xFF;
+  const uint8_t status = finger.loadModel(id);
+  unlockFinger();
+  return status;
+}
 
 void setup() {
   Serial.begin(115200);
@@ -226,14 +238,24 @@ void loop() {
   if (startRequested) {
     String eName, eCollege, eRole, eDept, eNote;
     uint16_t targetId;
+    uint16_t requestedCloudTargetId = 0;
     if (lockState()) {
       dashboardEnrollRequest = false;
       isEnrolling = true; cancelEnroll = false; duplicateFound = false;
       eName=pendingName; eCollege=pendingCollegeId;
       eRole=pendingRole; eDept=pendingDepartment; eNote=pendingNote;
-      targetId = nextEnrollID;
+      requestedCloudTargetId = pendingCloudEnrollTargetId;
+      pendingCloudEnrollTargetId = 0;
+      targetId = requestedCloudTargetId > 0 ? requestedCloudTargetId : nextEnrollID;
       unlockState();
     } else targetId = 0;
+
+    // If the dashboard supplied a specific slot, verify it is definitely empty
+    // before asking the sensor to store there. This prevents accidental overwrite.
+    const uint8_t requestedSlotStatus =
+      (requestedCloudTargetId > 0 && targetId > 0)
+        ? cloudFingerprintSlotStatus(targetId)
+        : CLOUD_FP_SLOT_EMPTY_CODE;
 
     if (targetId == 0) {
       addLog("ERROR", -1, "Fingerprint database full (200/200). Delete a record to free a slot.");
@@ -242,6 +264,27 @@ void loop() {
       if (lockState()) { pendingName=pendingCollegeId=pendingRole=pendingDepartment=pendingNote=""; isEnrolling=false; unlockState(); }
       if (activeCloudEnrollCommandId[0]) {
         CloudSync.completeCommand(activeCloudEnrollCommandId, false, "{\"ok\":false,\"error\":\"fingerprint_database_full\"}");
+        activeCloudEnrollCommandId[0] = '\0';
+        CloudSync.flushCommandAcks();
+      }
+      oledScanScreen();
+    } else if (requestedCloudTargetId > 0 && requestedSlotStatus != CLOUD_FP_SLOT_EMPTY_CODE) {
+      const bool occupied = requestedSlotStatus == FINGERPRINT_OK;
+      addLog("ERROR", requestedCloudTargetId,
+             occupied ? "Requested fingerprint slot is already occupied" :
+                        "Could not verify requested fingerprint slot");
+      oledErrorAnimation(occupied ? "SLOT OCCUPIED" : "SLOT CHECK FAILED",
+                         occupied ? "Choose free FP ID" : "Try command again");
+      smartDelay(1200);
+      if (lockState()) {
+        pendingName=pendingCollegeId=pendingRole=pendingDepartment=pendingNote="";
+        isEnrolling=false; cancelEnroll=false; duplicateFound=false;
+        unlockState();
+      }
+      if (activeCloudEnrollCommandId[0]) {
+        const char* slotError = occupied ? "fingerprint_slot_occupied" : "fingerprint_slot_check_failed";
+        String result = String("{\"ok\":false,\"error\":\"") + slotError + "\"}";
+        CloudSync.completeCommand(activeCloudEnrollCommandId, false, result.c_str());
         activeCloudEnrollCommandId[0] = '\0';
         CloudSync.flushCommandAcks();
       }
@@ -273,7 +316,8 @@ void loop() {
         Serial.print("Enrollment successful. ID: "); Serial.println(targetId);
         smartDelay(900);
         appendRegisteredEntry(targetId, p);
-        uint16_t nextFree = findNextFreeFrom(targetId + 1);
+        uint16_t nextFree = findNextFreeFrom(
+          requestedCloudTargetId > 0 ? 1 : (uint16_t)(targetId + 1));
         if (lockState()) {
           if (nextFree == 0xFFFF) {
             // A transport failure is never interpreted as an empty slot.
@@ -658,9 +702,14 @@ static void handleCloudCommand(const char* commandId, const char* command, const
     }
     String name = data["name"] | "";
     String college = data["college_id"] | "";
-    String role = data["role"] | "teacher";
+    String role = data["role"] | "Teacher";
     String department = data["department"] | "";
     String note = data["note"] | "";
+    const int requestedId = data["fingerprint_id"] | 0;
+    if (requestedId < 0 || requestedId > MAX_FINGERPRINTS) {
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"invalid_fingerprint_id\"}");
+      CloudSync.flushCommandAcks(); return;
+    }
     if (!name.length()) {
       CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"teacher_name_required\"}");
       CloudSync.flushCommandAcks(); return;
@@ -671,6 +720,7 @@ static void handleCloudCommand(const char* commandId, const char* command, const
     }
     pendingName = name; pendingCollegeId = college; pendingRole = role;
     pendingDepartment = department; pendingNote = note;
+    pendingCloudEnrollTargetId = (uint16_t)requestedId; // zero means legacy auto-slot selection
     dashboardEnrollRequest = true;
     strncpy(activeCloudEnrollCommandId, commandId, sizeof(activeCloudEnrollCommandId)-1);
     activeCloudEnrollCommandId[sizeof(activeCloudEnrollCommandId)-1] = '\0';
