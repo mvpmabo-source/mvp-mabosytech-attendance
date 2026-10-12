@@ -394,6 +394,18 @@ void CloudSyncClass::processHeartbeatResponse(const String& response) {
   DeserializationError err = deserializeJson(doc, response);
   if (err || !(doc["ok"] | false)) return;
 
+  // Some cloud deployments also return the persisted device settings alongside commands.
+  // Apply them through a callback so the app can validate and persist them on the main loop.
+  if (_settingsCallback && !doc["settings"].isNull()) {
+    String settingsPayload;
+    serializeJson(doc["settings"], settingsPayload);
+    _settingsCallback(settingsPayload.c_str());
+  } else if (_settingsCallback && !doc["device_settings"].isNull()) {
+    String settingsPayload;
+    serializeJson(doc["device_settings"], settingsPayload);
+    _settingsCallback(settingsPayload.c_str());
+  }
+
   JsonArray cmds = doc["pending_commands"].as<JsonArray>();
   if (cmds.isNull()) return;
 
