@@ -272,9 +272,37 @@ Deno.serve(async (req: Request) => {
         `Heartbeat command poll: device_id=${device.device_id} database_id=${device.id} targets=${commandTargets.join(",")} pending=${pendingCommands.length}`
       );
 
+      const { data: settingsRow, error: settingsError } = await adminClient
+        .from("device_settings")
+        .select("checkin_minutes, checkout_minutes, device_name, timezone")
+        .eq("id", 1)
+        .maybeSingle();
+
+      if (settingsError) {
+        // Commands must still be delivered even if the optional settings lookup fails.
+        console.warn("Device settings lookup failed during heartbeat:", settingsError.message);
+      }
+
+      const toHHMM = (value: unknown, fallback: string): string => {
+        const minutes = Number(value);
+        if (!Number.isInteger(minutes) || minutes < 0 || minutes >= 1440) return fallback;
+        return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+      };
+      const settings = settingsRow ? {
+        checkin_time: toHHMM(settingsRow.checkin_minutes, "07:55"),
+        checkout_time: toHHMM(settingsRow.checkout_minutes, "17:00"),
+        device_name: settingsRow.device_name || "MABOSYTECH Attendance",
+        timezone: settingsRow.timezone || "Africa/Kigali",
+      } : null;
+
+      console.log(
+        `Heartbeat command poll: device_id=${device.device_id} database_id=${device.id} targets=${commandTargets.join(",")} pending=${pendingCommands.length}`
+      );
+
       return jsonOk({
         received: true,
         pending_commands: pendingCommands,
+        settings,
       });
     }
 
@@ -366,30 +394,54 @@ Deno.serve(async (req: Request) => {
       const result = (body.result && typeof body.result === "object")
         ? body.result as Record<string, unknown>
         : {};
-      const fingerprintId = Number(result.fingerprint_id || 0);
       const payload = (commandRow.payload && typeof commandRow.payload === "object")
         ? commandRow.payload as Record<string, unknown>
         : {};
+      const reportedFingerprintId = Number(result.fingerprint_id || 0);
+      const requestedFingerprintId = Number(payload.fingerprint_id || reportedFingerprintId);
+      const isEnrollment = ["enroll_fingerprint", "enroll"].includes(commandRow.command || "");
 
-      // On successful enrollment, link the sensor-assigned template ID to the
-      // teacher created in the dashboard. A missing optional teacher_id must
-      // never cause an unrelated profile to be updated.
-      if (ackStatus === "acknowledged" &&
-          ["enroll_fingerprint", "enroll"].includes(commandRow?.command || "") &&
-          Number.isInteger(fingerprintId) && fingerprintId >= 1 && fingerprintId <= 200 &&
-          typeof payload.teacher_id === "string" && payload.teacher_id.length > 0) {
-        const { error: teacherError } = await adminClient
-          .from("teachers")
-          .update({ fingerprint_id: fingerprintId, enrollment_status: "enrolled", updated_at: new Date().toISOString() })
-          .eq("id", payload.teacher_id);
-        if (teacherError) {
-          console.error("Teacher fingerprint link update failed:", teacherError.message);
+      const updateData: Record<string, unknown> = {
+        status: ackStatus,
+        acknowledged_at: new Date().toISOString(),
+      };
+      if (Object.keys(result).length > 0) {
+        updateData.payload = { ...payload, result };
+      }
+
+      // The teachers table uses fingerprint_id as its primary key (not a UUID).
+      // Only mark enrolled when the firmware confirmed success for the requested slot.
+      if (isEnrollment &&
+          Number.isInteger(requestedFingerprintId) &&
+          requestedFingerprintId >= 1 && requestedFingerprintId <= 200) {
+        const resultOk = result.ok === true;
+        const idMatches = reportedFingerprintId === requestedFingerprintId;
+        if (ackStatus === "acknowledged" && resultOk && idMatches) {
+          const { error: teacherError } = await adminClient
+            .from("teachers")
+            .update({
+              enrollment_status: "enrolled",
+              enrolled_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            })
+            .eq("fingerprint_id", requestedFingerprintId);
+          if (teacherError) {
+            console.error("Teacher enrollment status update failed:", teacherError.message);
+          }
+        } else if (ackStatus === "failed" || !resultOk || !idMatches) {
+          const { error: teacherError } = await adminClient
+            .from("teachers")
+            .update({ enrollment_status: "failed", updated_at: new Date().toISOString() })
+            .eq("fingerprint_id", requestedFingerprintId);
+          if (teacherError) {
+            console.error("Teacher enrollment failure status update failed:", teacherError.message);
+          }
         }
       }
 
       const { error: ackError } = await adminClient
         .from("device_commands")
-        .update({ status: ackStatus, acknowledged_at: new Date().toISOString() })
+        .update(updateData)
         .eq("id", commandId)
         .eq("device_id", commandRow.device_id)
         .eq("status", "pending");
