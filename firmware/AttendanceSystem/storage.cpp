@@ -238,6 +238,35 @@ void clearPresenceState(uint16_t id) {
   prefsRemove(presenceKey(id).c_str());
 }
 
+bool clearAllTeacherProfilesAndPresence() {
+  // Deliberately remove only teacher profile/presence and attendance journal
+  // keys. Keep Wi-Fi/cloud credentials, device settings, login credentials,
+  // and the durable restart-command guard intact.
+  bool ok = false;
+  if (!lockPrefs(3000)) return false;
+  ok = true;
+  char key[32];
+  auto removeIfPresent = [&](const char* k) {
+    if (prefs.isKey(k) && !prefs.remove(k) && prefs.isKey(k)) ok = false;
+  };
+  for (uint16_t id = 1; id <= MAX_FINGERPRINTS; ++id) {
+    snprintf(key, sizeof(key), "%u_name", (unsigned)id); removeIfPresent(key);
+    snprintf(key, sizeof(key), "%u_cid", (unsigned)id); removeIfPresent(key);
+    snprintf(key, sizeof(key), "%u_role", (unsigned)id); removeIfPresent(key);
+    snprintf(key, sizeof(key), "%u_dept", (unsigned)id); removeIfPresent(key);
+    snprintf(key, sizeof(key), "%u_note", (unsigned)id); removeIfPresent(key);
+    snprintf(key, sizeof(key), "p_%u", (unsigned)id); removeIfPresent(key);
+  }
+  for (uint8_t slot = 0; slot < SD_LESSON_JOURNAL_SLOTS; ++slot) {
+    snprintf(key, sizeof(key), "lj_%u", (unsigned)slot);
+    removeIfPresent(key);
+  }
+  unlockPrefs();
+
+  if (!clearAttendanceJournal()) ok = false;
+  return ok;
+}
+
 void loadDeviceSetup() {
   int checkin = prefsGetInt(CFG_CHECKIN_KEY, CHECKIN_ON_TIME_MINUTES);
   int checkout = prefsGetInt(CFG_CHECKOUT_KEY, CHECKOUT_ON_TIME_MINUTES);
