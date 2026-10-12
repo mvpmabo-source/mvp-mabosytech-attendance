@@ -392,61 +392,102 @@ void CloudSyncClass::processHeartbeatResponse(const String& response) {
 
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, response);
-  if (err) return;
-
-  bool ok = doc["ok"] | false;
-  if (!ok) return;
+  if (err || !(doc["ok"] | false)) return;
 
   JsonArray cmds = doc["pending_commands"].as<JsonArray>();
   if (cmds.isNull()) return;
 
   for (JsonObject cmd : cmds) {
-    int cmdId = cmd["id"] | 0;
+    String id = cmd["id"].as<String>();
     const char* command = cmd["command"] | "";
-    const char* payload = "";
-    JsonObject payloadObj = cmd["payload"].as<JsonObject>();
-    if (!payloadObj.isNull()) {
-      String payloadStr;
-      serializeJson(payloadObj, payloadStr);
-      if (_pendingAckCount < CLOUD_MAX_PENDING_CMDS) {
-        _pendingAcks[_pendingAckCount].id = cmdId;
-        strncpy(_pendingAcks[_pendingAckCount].command, command, sizeof(_pendingAcks[_pendingAckCount].command) - 1);
-        _pendingAcks[_pendingAckCount].command[sizeof(_pendingAcks[_pendingAckCount].command) - 1] = '\0';
-        strncpy(_pendingAcks[_pendingAckCount].payload, payloadStr.c_str(), sizeof(_pendingAcks[_pendingAckCount].payload) - 1);
-        _pendingAcks[_pendingAckCount].payload[sizeof(_pendingAcks[_pendingAckCount].payload) - 1] = '\0';
-        _pendingAckCount++;
-      }
-    } else {
-      if (_pendingAckCount < CLOUD_MAX_PENDING_CMDS) {
-        _pendingAcks[_pendingAckCount].id = cmdId;
-        strncpy(_pendingAcks[_pendingAckCount].command, command, sizeof(_pendingAcks[_pendingAckCount].command) - 1);
-        _pendingAcks[_pendingAckCount].command[sizeof(_pendingAcks[_pendingAckCount].command) - 1] = '\0';
-        _pendingAcks[_pendingAckCount].payload[0] = '\0';
-        _pendingAckCount++;
-      }
-    }
+    if (!id.length() || !command[0]) continue;
 
-    // Execute the command via the app callback
-    if (_commandCallback) {
-      _commandCallback(command, payload);
+    int slot = -1;
+    for (int i = 0; i < _pendingAckCount; i++) {
+      if (strcmp(_pendingAcks[i].id, id.c_str()) == 0) { slot = i; break; }
+    }
+    if (slot < 0) {
+      if (_pendingAckCount >= CLOUD_MAX_PENDING_CMDS) {
+        Serial.println("[CLOUD] Command queue full; command left pending on server.");
+        continue;
+      }
+      slot = _pendingAckCount++;
+      memset(&_pendingAcks[slot], 0, sizeof(_pendingAcks[slot]));
+      strncpy(_pendingAcks[slot].id, id.c_str(), sizeof(_pendingAcks[slot].id)-1);
+      strncpy(_pendingAcks[slot].command, command, sizeof(_pendingAcks[slot].command)-1);
+      JsonVariantConst payload = cmd["payload"];
+      if (!payload.isNull()) {
+        String payloadStr;
+        serializeJson(payload, payloadStr);
+        strncpy(_pendingAcks[slot].payload, payloadStr.c_str(), sizeof(_pendingAcks[slot].payload)-1);
+      } else {
+        strcpy(_pendingAcks[slot].payload, "{}");
+      }
+      _pendingAcks[slot].ackReady = false;
+      _pendingAcks[slot].succeeded = false;
+      Serial.printf("[CLOUD] Command received id=%s type=%s\n", id.c_str(), command);
+      if (_commandCallback) {
+        _commandCallback(_pendingAcks[slot].id, _pendingAcks[slot].command, _pendingAcks[slot].payload);
+      } else {
+        completeCommand(id.c_str(), false, "{\"error\":\"No command handler registered\"}");
+      }
     }
   }
 }
 
-void CloudSyncClass::sendCommandAcks() {
+void CloudSyncClass::completeCommand(const char* commandId, bool success, const char* resultJson) {
+  if (!commandId || !commandId[0]) return;
   for (int i = 0; i < _pendingAckCount; i++) {
+    if (strcmp(_pendingAcks[i].id, commandId) != 0) continue;
+    _pendingAcks[i].succeeded = success;
+    _pendingAcks[i].ackReady = true;
+    if (resultJson && resultJson[0]) {
+      strncpy(_pendingAcks[i].result, resultJson, sizeof(_pendingAcks[i].result)-1);
+    } else {
+      strcpy(_pendingAcks[i].result, success ? "{\"ok\":true}" : "{\"ok\":false}");
+    }
+    return;
+  }
+}
+
+void CloudSyncClass::flushCommandAcks() {
+  sendCommandAcks();
+}
+
+void CloudSyncClass::sendCommandAcks() {
+  int writeIndex = 0;
+  for (int i = 0; i < _pendingAckCount; i++) {
+    if (!_pendingAcks[i].ackReady) {
+      if (writeIndex != i) _pendingAcks[writeIndex] = _pendingAcks[i];
+      writeIndex++;
+      continue;
+    }
     JsonDocument doc;
     doc["type"] = "ack_command";
     doc["device_id"] = _deviceId;
     doc["api_key"] = _apiKey;
     doc["command_id"] = _pendingAcks[i].id;
-    doc["ack_status"] = "acknowledged";
+    doc["ack_status"] = _pendingAcks[i].succeeded ? "acknowledged" : "failed";
+    JsonDocument resultDoc;
+    if (deserializeJson(resultDoc, _pendingAcks[i].result) == DeserializationError::Ok) {
+      doc["result"] = resultDoc.as<JsonVariant>();
+    } else {
+      doc["result"] = _pendingAcks[i].result;
+    }
 
     String body;
     serializeJson(doc, body);
-    postJson(body, nullptr, nullptr);
+    int status = 0;
+    if (postJson(body, nullptr, &status) && status >= 200 && status < 300) {
+      Serial.printf("[CLOUD] Command ack sent id=%s status=%s\n", _pendingAcks[i].id,
+                    _pendingAcks[i].succeeded ? "acknowledged" : "failed");
+    } else {
+      if (writeIndex != i) _pendingAcks[writeIndex] = _pendingAcks[i];
+      writeIndex++;
+      Serial.printf("[CLOUD] Command ack failed id=%s HTTP=%d; will retry\n", _pendingAcks[i].id, status);
+    }
   }
-  _pendingAckCount = 0;
+  _pendingAckCount = writeIndex;
 }
 
 // ──────────────────────────────────────────────
