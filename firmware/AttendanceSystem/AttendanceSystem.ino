@@ -81,7 +81,8 @@ static void serviceFactoryReset() {
     }
     CloudSync.clearOutboxRamForFactoryReset();
     clearFactoryResetRamState();
-    rebuildRegisteredCache();
+    // The sensor database was emptied and the RAM registry reset above;
+    // avoid rescanning all 200 slots synchronously on the attendance loop.
     refreshTemplateCountCache();
     Serial.println("[RESET] Hardware, SD records, profiles and outbox reset; device settings preserved.");
     finishFactoryResetCommand(true, nullptr);
