@@ -372,6 +372,13 @@ bool CloudSyncClass::loadOutboxFromSD() {
   return loaded > 0;
 }
 
+void CloudSyncClass::clearOutboxRamForFactoryReset() {
+  // SD outbox files are removed by sdTask before this is called. Drop the
+  // RAM window too so pre-reset attendance events cannot be re-uploaded.
+  _outboxCount = 0;
+  Serial.println("[CLOUD] In-memory attendance outbox cleared for clean start.");
+}
+
 void CloudSyncClass::recoverOutboxFromSD() {
   if (!_enabled || !sdAvailable) return;
   recoverOutboxFiles();
