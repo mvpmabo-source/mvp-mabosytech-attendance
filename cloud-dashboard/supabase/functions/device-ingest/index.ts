@@ -217,17 +217,64 @@ Deno.serve(async (req: Request) => {
           .eq("device_id", deviceId);
       }
 
-      const { data: pendingCommands } = await adminClient
-        .from("device_commands")
-        .select("id, command, payload, created_at")
-        .eq("device_id", deviceId)
-        .eq("status", "pending")
-        .order("created_at", { ascending: true })
-        .limit(5);
+      // Older dashboard builds have stored device_commands.device_id as either
+      // devices.device_id (human-readable ESP ID) or devices.id (database UUID).
+      // Resolve commands only against the authenticated device's own identifiers.
+      const commandTargets = [...new Set([String(device.device_id), String(device.id)].filter(Boolean))];
+      const pendingById = new Map<string, {
+        id: string;
+        command: string;
+        payload: Record<string, unknown> | null;
+        created_at: string;
+      }>();
+      let successfulCommandLookup = false;
+
+      for (const targetId of commandTargets) {
+        const { data: rows, error: commandQueryError } = await adminClient
+          .from("device_commands")
+          .select("id, device_id, command, payload, created_at")
+          .eq("device_id", targetId)
+          .eq("status", "pending")
+          .order("created_at", { ascending: true })
+          .limit(5);
+
+        if (commandQueryError) {
+          // A UUID column rejects the text ESP ID; the UUID lookup below can still succeed.
+          console.warn("Pending command lookup failed for one device identifier:", commandQueryError.message);
+          continue;
+        }
+
+        successfulCommandLookup = true;
+        for (const row of rows || []) {
+          // Never deliver rows not explicitly assigned to this authenticated device.
+          if (!commandTargets.includes(String(row.device_id))) continue;
+          if (!pendingById.has(String(row.id))) {
+            pendingById.set(String(row.id), {
+              id: String(row.id),
+              command: String(row.command),
+              payload: row.payload && typeof row.payload === "object" ? row.payload as Record<string, unknown> : {},
+              created_at: String(row.created_at),
+            });
+          }
+        }
+      }
+
+      if (!successfulCommandLookup) {
+        return jsonError(500, "Pending command lookup failed");
+      }
+
+      const pendingCommands = [...pendingById.values()]
+        .sort((a, b) => a.created_at.localeCompare(b.created_at))
+        .slice(0, 5)
+        .map(({ id, command, payload, created_at }) => ({ id, command, payload, created_at }));
+
+      if (pendingCommands.length > 0) {
+        console.log(`Delivering ${pendingCommands.length} pending command(s) to authenticated device ${device.device_id}`);
+      }
 
       return jsonOk({
         received: true,
-        pending_commands: pendingCommands || [],
+        pending_commands: pendingCommands,
       });
     }
 
@@ -286,19 +333,41 @@ Deno.serve(async (req: Request) => {
         return jsonError(400, "Missing command_id or invalid ack_status");
       }
 
-      const { data: commandRow } = await adminClient
+      // Resolve by command ID first, then verify ownership against both identifiers
+      // of the already-authenticated device. Using deviceId directly here breaks
+      // installations where device_commands.device_id is a foreign-key UUID.
+      const { data: commandRow, error: commandLookupError } = await adminClient
         .from("device_commands")
-        .select("command,payload")
+        .select("id, device_id, command, payload, status")
         .eq("id", commandId)
-        .eq("device_id", deviceId)
-        .eq("status", "pending")
         .maybeSingle();
+
+      if (commandLookupError) {
+        return jsonError(500, "Command lookup failed", { detail: commandLookupError.message });
+      }
+      if (!commandRow) {
+        return jsonError(404, "Command not found");
+      }
+
+      const authenticatedDeviceIds = new Set([String(device.device_id), String(device.id)]);
+      if (!authenticatedDeviceIds.has(String(commandRow.device_id))) {
+        return jsonError(403, "Command does not belong to this device");
+      }
+
+      // A retry after a lost HTTP response is safe: if the same final status was
+      // already stored, acknowledge it idempotently instead of trapping the ESP queue.
+      if (commandRow.status !== "pending") {
+        if (commandRow.status === ackStatus) {
+          return jsonOk({ acknowledged: true, already_processed: true });
+        }
+        return jsonError(409, "Command already finalized with a different status");
+      }
 
       const result = (body.result && typeof body.result === "object")
         ? body.result as Record<string, unknown>
         : {};
       const fingerprintId = Number(result.fingerprint_id || 0);
-      const payload = (commandRow?.payload && typeof commandRow.payload === "object")
+      const payload = (commandRow.payload && typeof commandRow.payload === "object")
         ? commandRow.payload as Record<string, unknown>
         : {};
 
@@ -322,7 +391,7 @@ Deno.serve(async (req: Request) => {
         .from("device_commands")
         .update({ status: ackStatus, acknowledged_at: new Date().toISOString() })
         .eq("id", commandId)
-        .eq("device_id", deviceId)
+        .eq("device_id", commandRow.device_id)
         .eq("status", "pending");
 
       if (ackError) {
