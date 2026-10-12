@@ -13,6 +13,7 @@ static volatile uint8_t factoryResetStage = 0;
 static char activeFactoryResetCommandId[40] = "";
 
 static void finishFactoryResetCommand(bool ok, const char* error) {
+  if (ok) prefsPutBool("last_factory_reset_done", true);
   if (activeFactoryResetCommandId[0]) {
     String result = ok
       ? String("{\"ok\":true,\"message\":\"factory_reset_complete\"}")
@@ -798,10 +799,25 @@ static void handleCloudCommand(const char* commandId, const char* command, const
   }
 
   if (!strcmp(command, "factory_reset")) {
-    if (factoryResetStage != 0 || isEnrolling || !fingerprintSensorOk) {
-      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"device_busy_or_sensor_unavailable\"}");
+    if (factoryResetStage != 0 || isEnrolling || !fingerprintSensorOk || !sdAvailable) {
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"device_busy_or_sensor_or_sd_unavailable\"}");
       CloudSync.flushCommandAcks();
       return;
+    }
+    const String previousResetId = prefsGetString("last_factory_reset_cmd", "");
+    const bool previousResetDone = prefsGetBool("last_factory_reset_done", false);
+    if (previousResetId == String(commandId) && previousResetDone) {
+      CloudSync.completeCommand(commandId, true, "{\"ok\":true,\"message\":\"factory_reset_already_completed\"}");
+      CloudSync.flushCommandAcks();
+      return;
+    }
+    if (previousResetId != String(commandId)) {
+      if (!prefsPutString("last_factory_reset_cmd", String(commandId)) ||
+          !prefsPutBool("last_factory_reset_done", false)) {
+        CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"reset_guard_persist_failed\"}");
+        CloudSync.flushCommandAcks();
+        return;
+      }
     }
     strncpy(activeFactoryResetCommandId, commandId, sizeof(activeFactoryResetCommandId) - 1);
     activeFactoryResetCommandId[sizeof(activeFactoryResetCommandId) - 1] = '\\0';
