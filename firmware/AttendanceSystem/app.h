@@ -203,7 +203,7 @@ void smartDelay(unsigned long);
 void oledScreen(String,String line1="",String line2="",String line3=""); void oledBig(String,String line1="",String line2=""); void oledScanScreen(); void oledScanAnimation(String,String,uint16_t); void oledProgressBar(String,String,uint8_t); void oledSuccessAnimation(String,String line2=""); void oledErrorAnimation(String,String line2=""); String clipText(String,uint8_t); void drawCenteredText(String,int,uint8_t); void drawTitleBar(String); void drawMiniFingerprint(int,int); void drawLoadingDots(int,int,uint8_t); void drawMovingBar(int,uint8_t); void drawProgress(uint8_t); void drawWiFiIcon(bool);
 bool buttonPressed(uint8_t,unsigned long&); bool cancelButtonPressed(); bool checkCancelDuringEnroll();
 void scanFingerprint(); void fpSetLed(bool); void fpNoteActivity(); void fpWake(); void fpSleepNow(); bool fpShouldScanNow(); void fpTouchSelfTest(); uint8_t enrollFingerprint(uint16_t); void waitForFingerRemove(); uint16_t findNextFreeFrom(uint16_t); void printSensorParameters(); void refreshTemplateCountSerialOnly(); void refreshTemplateCountCache(); void rebuildRegisteredCache(); void appendRegisteredEntry(uint16_t,PersonProfile); void removeRegisteredEntry(uint16_t); void setMatchingSecuritySerialOnly(); void attendanceSuccessFeedback(); void attendanceFailureFeedback();
-void initializeSD(); bool tryQuickSdMount();
+void initializeSD(); bool tryQuickSdMount(); bool resetAllLocalDataOnSd(); bool clearAllTeacherProfilesAndPresence();
 void setSdAvailableState(bool available, const char* reason = nullptr);
 void loadAttendanceJournal();
 bool storageCanAcceptAttendance();
