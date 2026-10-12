@@ -756,6 +756,14 @@ void CloudSyncClass::processOutbox() {
 // ──────────────────────────────────────────────
 
 bool CloudSyncClass::postJson(const String& body, String* responseOut, int* httpStatusOut) {
+  // Do not start a long TLS handshake when the STA link is down; the caller
+  // retains commands/outbox entries and retries after Wi-Fi reconnects.
+  if (WiFi.status() != WL_CONNECTED) {
+    if (httpStatusOut) *httpStatusOut = 0;
+    Serial.println("[CLOUD] Request deferred: Wi-Fi is not connected.");
+    return false;
+  }
+
   // TLS handshakes require a large contiguous internal-RAM allocation.
   // Log both total and largest-block heap to distinguish low memory from
   // fragmentation without weakening certificate verification.
