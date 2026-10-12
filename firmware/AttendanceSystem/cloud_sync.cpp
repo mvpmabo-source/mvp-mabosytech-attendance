@@ -764,7 +764,7 @@ bool CloudSyncClass::postJson(const String& body, String* responseOut, int* http
                   (unsigned int)ESP.getMaxAllocHeap(),
                   (unsigned int)ESP.getMinFreeHeap(),
                   (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-                  (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT))
+                  (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     if (httpStatusOut) *httpStatusOut = 0;
     return false;
   }
