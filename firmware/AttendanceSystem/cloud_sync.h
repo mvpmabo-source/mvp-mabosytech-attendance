@@ -25,8 +25,6 @@
 #include <WiFiClientSecure.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
-#include <freertos/queue.h>
-#include <freertos/task.h>
 #include "config.h"
 
 extern SemaphoreHandle_t cloudSdMutex;
@@ -115,10 +113,6 @@ public:
   void onCommand(CloudCommandCallback cb) { _commandCallback = cb; }
   void onSettings(CloudSettingsCallback cb) { _settingsCallback = cb; }
 
-  // Register the sensor's existing templates once at boot. Inventory uploads
-  // run in the cloud worker in small batches and never block attendance scans.
-  void setFingerprintInventory(const char* inventoryJson);
-  bool startCommandPolling();
   void completeCommand(const char* commandId, bool success, const char* resultJson = nullptr);
   void flushCommandAcks();
 
@@ -142,30 +136,10 @@ private:
   int _pendingAckCount = 0;
 
   unsigned long _lastSyncMs = 0;
-
-  struct CommandPollResponse {
-    int httpStatus;
-    char body[1536];
-  };
-
-  SemaphoreHandle_t _networkMutex = nullptr;
-  QueueHandle_t _commandResponseQueue = nullptr;
-  TaskHandle_t _commandPollTaskHandle = nullptr;
-  volatile bool _commandInFlight = false;
-
-  String _fingerprintInventory;
-  uint16_t _inventoryOffset = 0;
-  bool _inventorySyncComplete = true;
-
-  static void commandPollTaskEntry(void* parameter);
-  void commandPollTask();
-  bool syncNextFingerprintInventoryBatch();
-
-  bool postJson(const String& body, String* responseOut, int* httpStatusOut,
-                uint32_t timeoutMs = CLOUD_TIMEOUT_MS);
+  bool postJson(const String& body, String* responseOut, int* httpStatusOut);
   void processOutbox();
   void generateEventUid(char* buf, size_t bufLen, const char* date, const char* timeStr, int fpId);
-  void processHeartbeatResponse(const String& response, bool fromCommandPoll = false);
+  void processHeartbeatResponse(const String& response);
   void sendCommandAcks();
 
   // SD persistent outbox helpers
