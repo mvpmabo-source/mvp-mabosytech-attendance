@@ -1,5 +1,5 @@
 import { useEffect, useState, useMemo, useCallback } from "react";
-import { Users, Search, LogIn, LogOut, Trash2, RefreshCw } from "lucide-react";
+import { Users, Search, LogIn, LogOut, Trash2, RefreshCw, UserPlus } from "lucide-react";
 import { supabase, type AttendanceEvent } from "@/lib/supabase";
 import { Card, LoadingSpinner, EmptyState, ErrorState, Badge } from "@/components/ui";
 
@@ -16,6 +16,9 @@ export function PeoplePage() {
   const [people, setPeople] = useState<Person[]>([]);
   const [search, setSearch] = useState("");
   const [deletingId, setDeletingId] = useState<number | null>(null);
+  const [showEnrollForm, setShowEnrollForm] = useState(false);
+  const [enrollBusy, setEnrollBusy] = useState(false);
+  const [newTeacher, setNewTeacher] = useState({ name: "", college_id: "", role: "Teacher", department: "", note: "" });
 
   const load = useCallback(async () => {
     try {
@@ -62,6 +65,37 @@ export function PeoplePage() {
     return () => clearInterval(interval);
   }, [load]);
 
+  async function queueEnrollment(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!newTeacher.name.trim()) { setError("Teacher name is required."); return; }
+    setEnrollBusy(true); setError(null); setNotice(null);
+    try {
+      const { data: devices, error: deviceError } = await supabase.from("devices").select("device_id").order("created_at", { ascending: false }).limit(1);
+      if (deviceError) throw new Error(deviceError.message);
+      const deviceId = devices?.[0]?.device_id;
+      if (!deviceId) throw new Error("No registered ESP32 device found.");
+      const { error: commandError } = await supabase.from("device_commands").insert({
+        device_id: deviceId,
+        command: "enroll_fingerprint",
+        payload: {
+          name: newTeacher.name.trim(),
+          college_id: newTeacher.college_id.trim(),
+          role: newTeacher.role,
+          department: newTeacher.department.trim(),
+          note: newTeacher.note.trim(),
+          fingerprint_id: 0,
+        },
+        status: "pending",
+      });
+      if (commandError) throw new Error(commandError.message);
+      setNotice(`Enrollment for ${newTeacher.name.trim()} queued. The ESP32 will prompt for the finger; the teacher is added to the registry only after the sensor confirms enrollment.`);
+      setNewTeacher({ name: "", college_id: "", role: "Teacher", department: "", note: "" });
+      setShowEnrollForm(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not queue enrollment");
+    } finally { setEnrollBusy(false); }
+  }
+
   async function deleteFingerprint(person: Person) {
     if (!window.confirm(`Delete fingerprint ID ${person.fingerprint_id} (${person.name}) from the ESP32 sensor? The teacher will be removed from the active registry only after the device confirms deletion. Attendance history is preserved unless you run Clean Start.`)) return;
     setDeletingId(person.fingerprint_id);
@@ -93,6 +127,21 @@ export function PeoplePage() {
   return (
     <div className="space-y-4">
       {notice && <Card className="p-3 border-sky-200 bg-sky-50"><p className="text-sm text-sky-800">{notice}</p></Card>}
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <p className="text-sm text-slate-500">Manage active sensor fingerprints and teacher metadata.</p>
+        <button onClick={() => setShowEnrollForm((v) => !v)} className="inline-flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-lg bg-teal-700 text-white hover:bg-teal-800"><UserPlus className="w-4 h-4" />Enroll new teacher</button>
+      </div>
+      {showEnrollForm && <Card className="p-4">
+        <h3 className="font-semibold text-slate-800 mb-3">New teacher enrollment</h3>
+        <form onSubmit={queueEnrollment} className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <label className="text-sm text-slate-600">Full name *<input required value={newTeacher.name} onChange={(e) => setNewTeacher((v) => ({ ...v, name: e.target.value }))} className="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg" /></label>
+          <label className="text-sm text-slate-600">College ID<input value={newTeacher.college_id} onChange={(e) => setNewTeacher((v) => ({ ...v, college_id: e.target.value }))} className="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg" /></label>
+          <label className="text-sm text-slate-600">Role<select value={newTeacher.role} onChange={(e) => setNewTeacher((v) => ({ ...v, role: e.target.value }))} className="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg"><option>Teacher</option><option>Administrator</option><option>Staff</option></select></label>
+          <label className="text-sm text-slate-600">Department<input value={newTeacher.department} onChange={(e) => setNewTeacher((v) => ({ ...v, department: e.target.value }))} className="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg" /></label>
+          <label className="text-sm text-slate-600 md:col-span-2">Note<input value={newTeacher.note} onChange={(e) => setNewTeacher((v) => ({ ...v, note: e.target.value }))} className="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg" /></label>
+          <div className="md:col-span-2 flex gap-2"><button type="submit" disabled={enrollBusy} className="px-4 py-2 rounded-lg bg-teal-700 text-white text-sm disabled:opacity-50">{enrollBusy ? "Sending…" : "Start enrollment on ESP32"}</button><button type="button" onClick={() => setShowEnrollForm(false)} className="px-4 py-2 rounded-lg border border-slate-200 text-sm">Cancel</button></div>
+        </form>
+      </Card>}
       <div className="flex items-center gap-3">
         <div className="relative flex-1 max-w-xs">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
