@@ -286,6 +286,38 @@ Deno.serve(async (req: Request) => {
         return jsonError(400, "Missing command_id or invalid ack_status");
       }
 
+      const { data: commandRow } = await adminClient
+        .from("device_commands")
+        .select("command,payload")
+        .eq("id", commandId)
+        .eq("device_id", deviceId)
+        .eq("status", "pending")
+        .maybeSingle();
+
+      const result = (body.result && typeof body.result === "object")
+        ? body.result as Record<string, unknown>
+        : {};
+      const fingerprintId = Number(result.fingerprint_id || 0);
+      const payload = (commandRow?.payload && typeof commandRow.payload === "object")
+        ? commandRow.payload as Record<string, unknown>
+        : {};
+
+      // On successful enrollment, link the sensor-assigned template ID to the
+      // teacher created in the dashboard. A missing optional teacher_id must
+      // never cause an unrelated profile to be updated.
+      if (ackStatus === "acknowledged" &&
+          ["enroll_fingerprint", "enroll"].includes(commandRow?.command || "") &&
+          Number.isInteger(fingerprintId) && fingerprintId >= 1 && fingerprintId <= 200 &&
+          typeof payload.teacher_id === "string" && payload.teacher_id.length > 0) {
+        const { error: teacherError } = await adminClient
+          .from("teachers")
+          .update({ fingerprint_id: fingerprintId, enrollment_status: "enrolled", updated_at: new Date().toISOString() })
+          .eq("id", payload.teacher_id);
+        if (teacherError) {
+          console.error("Teacher fingerprint link update failed:", teacherError.message);
+        }
+      }
+
       const { error: ackError } = await adminClient
         .from("device_commands")
         .update({ status: ackStatus, acknowledged_at: new Date().toISOString() })
