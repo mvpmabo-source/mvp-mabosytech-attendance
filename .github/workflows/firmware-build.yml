@@ -6,6 +6,11 @@ on:
     paths:
       - "firmware/AttendanceSystem/**"
       - ".github/workflows/firmware-build.yml"
+  pull_request:
+    branches: [phase-3-firmware-cloud-sync]
+    paths:
+      - "firmware/AttendanceSystem/**"
+      - ".github/workflows/firmware-build.yml"
   workflow_dispatch:
 
 jobs:
@@ -14,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: phase-3-firmware-cloud-sync
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: arduino/setup-arduino-cli@v2
       - name: Install ESP32 Arduino core
         run: |
