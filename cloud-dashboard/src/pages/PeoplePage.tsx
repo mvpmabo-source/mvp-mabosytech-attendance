@@ -1,34 +1,88 @@
-import { useEffect, useState, useMemo } from "react";
-import { Users, Search, LogIn, LogOut } from "lucide-react";
+import { useEffect, useState, useMemo, useCallback } from "react";
+import { Users, Search, LogIn, LogOut, Trash2, RefreshCw } from "lucide-react";
 import { supabase, type AttendanceEvent } from "@/lib/supabase";
 import { Card, LoadingSpinner, EmptyState, ErrorState, Badge } from "@/components/ui";
 
-type Person = { fingerprint_id: number; name: string; college_id: string; role: string; department: string; check_ins: number; check_outs: number; last_seen: string | null; last_type: string | null };
+type Person = {
+  fingerprint_id: number; name: string; college_id: string; role: string; department: string;
+  check_ins: number; check_outs: number; last_seen: string | null; last_type: string | null;
+  enrollment_status: string;
+};
 
 export function PeoplePage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [people, setPeople] = useState<Person[]>([]);
   const [search, setSearch] = useState("");
+  const [deletingId, setDeletingId] = useState<number | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const [teacherRes, eventRes] = await Promise.all([
+        supabase.from("teachers").select("*").order("fingerprint_id", { ascending: true }),
+        supabase.from("attendance_events").select("fingerprint_id, name, college_id, role, department, event_type, event_date, event_time").order("event_date", { ascending: false }).order("event_time", { ascending: false }),
+      ]);
+      if (teacherRes.error) throw new Error(teacherRes.error.message);
+      if (eventRes.error) throw new Error(eventRes.error.message);
+      const events = (eventRes.data as AttendanceEvent[]) ?? [];
+      const stats = new Map<number, Person>();
+      for (const e of events) {
+        let p = stats.get(e.fingerprint_id);
+        if (!p) {
+          p = { fingerprint_id: e.fingerprint_id, name: e.name || `ID ${e.fingerprint_id}`, college_id: e.college_id || "", role: e.role || "", department: e.department || "", check_ins: 0, check_outs: 0, last_seen: null, last_type: null, enrollment_status: "enrolled" };
+          stats.set(e.fingerprint_id, p);
+        }
+        if (!p.last_seen) { p.last_seen = `${e.event_date} ${e.event_time}`; p.last_type = e.event_type; }
+        if (e.event_type === "CHECK_IN") p.check_ins++; else if (e.event_type === "CHECK_OUT") p.check_outs++;
+      }
+      const registry = (teacherRes.data ?? []) as Array<{ fingerprint_id: number; name?: string; college_id?: string; role?: string; department?: string; enrollment_status?: string }>;
+      setPeople(registry.map((t) => {
+        const s = stats.get(t.fingerprint_id);
+        return {
+          fingerprint_id: t.fingerprint_id,
+          name: t.name || s?.name || `ID ${t.fingerprint_id}`,
+          college_id: t.college_id || s?.college_id || "",
+          role: t.role || s?.role || "Teacher",
+          department: t.department || s?.department || "",
+          check_ins: s?.check_ins ?? 0, check_outs: s?.check_outs ?? 0,
+          last_seen: s?.last_seen ?? null, last_type: s?.last_type ?? null,
+          enrollment_status: t.enrollment_status || "enrolled",
+        };
+      }));
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load teacher registry");
+    } finally { setLoading(false); }
+  }, []);
 
   useEffect(() => {
-    async function load() {
-      try {
-        const { data, error: qErr } = await supabase.from("attendance_events").select("fingerprint_id, name, college_id, role, department, event_type, event_date, event_time").order("event_date", { ascending: false }).order("event_time", { ascending: false });
-        if (qErr) throw new Error(qErr.message);
-        const events = (data as AttendanceEvent[]) ?? [];
-        const personMap = new Map<number, Person>();
-        for (const e of events) {
-          let p = personMap.get(e.fingerprint_id);
-          if (!p) { p = { fingerprint_id: e.fingerprint_id, name: e.name || `ID ${e.fingerprint_id}`, college_id: e.college_id, role: e.role, department: e.department, check_ins: 0, check_outs: 0, last_seen: null, last_type: null }; personMap.set(e.fingerprint_id, p); }
-          if (!p.last_seen) { p.last_seen = `${e.event_date} ${e.event_time}`; p.last_type = e.event_type; }
-          if (e.event_type === "CHECK_IN") p.check_ins++; else if (e.event_type === "CHECK_OUT") p.check_outs++;
-        }
-        setPeople(Array.from(personMap.values()).sort((a, b) => a.fingerprint_id - b.fingerprint_id));
-      } catch (err) { setError(err instanceof Error ? err.message : "Failed to load people"); } finally { setLoading(false); }
-    }
-    load();
-  }, []);
+    void load();
+    const interval = setInterval(() => { void load(); }, 5000);
+    return () => clearInterval(interval);
+  }, [load]);
+
+  async function deleteFingerprint(person: Person) {
+    if (!window.confirm(`Delete fingerprint ID ${person.fingerprint_id} (${person.name}) from the ESP32 sensor? The teacher will be removed from the active registry only after the device confirms deletion. Attendance history is preserved unless you run Clean Start.`)) return;
+    setDeletingId(person.fingerprint_id);
+    setNotice(null);
+    try {
+      const { data: devices, error: deviceError } = await supabase.from("devices").select("device_id").order("created_at", { ascending: false }).limit(1);
+      if (deviceError) throw new Error(deviceError.message);
+      const deviceId = devices?.[0]?.device_id;
+      if (!deviceId) throw new Error("No registered ESP32 device found.");
+      const { error: commandError } = await supabase.from("device_commands").insert({
+        device_id: deviceId, command: "delete_fingerprint",
+        payload: { fingerprint_id: person.fingerprint_id },
+        status: "pending",
+      });
+      if (commandError) throw new Error(commandError.message);
+      setNotice(`Delete request for fingerprint ID ${person.fingerprint_id} queued. The registry updates after the ESP32 confirms sensor deletion.`);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not queue fingerprint deletion");
+    } finally { setDeletingId(null); }
+  }
 
   const filteredPeople = useMemo(() => {
     if (!search.trim()) return people;
@@ -38,16 +92,18 @@ export function PeoplePage() {
 
   return (
     <div className="space-y-4">
+      {notice && <Card className="p-3 border-sky-200 bg-sky-50"><p className="text-sm text-sky-800">{notice}</p></Card>}
       <div className="flex items-center gap-3">
         <div className="relative flex-1 max-w-xs">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
-          <input type="text" placeholder="Search people..." value={search} onChange={(e) => setSearch(e.target.value)} className="w-full pl-10 pr-4 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500" />
+          <input type="text" placeholder="Search teachers..." value={search} onChange={(e) => setSearch(e.target.value)} className="w-full pl-10 pr-4 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500" />
         </div>
-        <span className="text-sm text-slate-500">{filteredPeople.length} {filteredPeople.length === 1 ? "person" : "people"}</span>
+        <span className="text-sm text-slate-500">{filteredPeople.length} {filteredPeople.length === 1 ? "teacher" : "teachers"}</span>
+        <button onClick={() => void load()} className="inline-flex items-center gap-2 px-3 py-2 text-sm rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50"><RefreshCw className="w-4 h-4" />Refresh</button>
       </div>
       <Card className="overflow-hidden">
-        {loading ? <LoadingSpinner label="Loading people..." /> : error ? <ErrorState message={error} /> : filteredPeople.length === 0 ? (
-          <EmptyState icon={<Users className="w-7 h-7" />} title={search ? "No matching people" : "No people records yet"} description={search ? "Try a different search term." : "Registered fingerprint profiles will appear here once attendance events are synced from the ESP32."} />
+        {loading ? <LoadingSpinner label="Loading teachers..." /> : error ? <ErrorState message={error} /> : filteredPeople.length === 0 ? (
+          <EmptyState icon={<Users className="w-7 h-7" />} title={search ? "No matching teachers" : "No active teacher fingerprints"} description={search ? "Try a different search term." : "Only teachers in the active registry appear here. Legacy attendance history is not treated as an active fingerprint."} />
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -60,18 +116,20 @@ export function PeoplePage() {
                 <th className="text-center px-4 py-3 font-medium text-slate-600">Check-ins</th>
                 <th className="text-center px-4 py-3 font-medium text-slate-600">Check-outs</th>
                 <th className="text-left px-4 py-3 font-medium text-slate-600 hidden sm:table-cell">Last Activity</th>
+                <th className="text-right px-4 py-3 font-medium text-slate-600">Action</th>
               </tr></thead>
               <tbody className="divide-y divide-slate-100">
                 {filteredPeople.map((p) => (
-                  <tr key={p.fingerprint_id} className="hover:bg-slate-50 transition-colors">
+                  <tr key={p.fingerprint_id} className="hover:bg-slate-50">
                     <td className="px-4 py-3 text-slate-700 font-mono">{p.fingerprint_id}</td>
                     <td className="px-4 py-3 text-slate-700 font-medium whitespace-nowrap">{p.name}</td>
                     <td className="px-4 py-3 text-slate-500 hidden md:table-cell whitespace-nowrap">{p.college_id || "—"}</td>
-                    <td className="px-4 py-3 whitespace-nowrap">{p.role && <Badge className={p.role === "Administrator" ? "bg-teal-50 text-teal-700 border-teal-200" : "bg-slate-100 text-slate-600 border-slate-200"}>{p.role}</Badge>}</td>
+                    <td className="px-4 py-3 whitespace-nowrap"><Badge className={p.enrollment_status === "failed" ? "bg-rose-50 text-rose-700 border-rose-200" : "bg-slate-100 text-slate-600 border-slate-200"}>{p.role || "Teacher"} · {p.enrollment_status}</Badge></td>
                     <td className="px-4 py-3 text-slate-500 hidden lg:table-cell whitespace-nowrap">{p.department || "—"}</td>
                     <td className="px-4 py-3 text-center"><span className="inline-flex items-center gap-1 text-emerald-600 font-medium"><LogIn className="w-3.5 h-3.5" />{p.check_ins}</span></td>
                     <td className="px-4 py-3 text-center"><span className="inline-flex items-center gap-1 text-blue-600 font-medium"><LogOut className="w-3.5 h-3.5" />{p.check_outs}</span></td>
-                    <td className="px-4 py-3 text-slate-500 text-xs hidden sm:table-cell whitespace-nowrap">{p.last_seen ? <span>{p.last_seen}</span> : "—"}</td>
+                    <td className="px-4 py-3 text-slate-500 text-xs hidden sm:table-cell whitespace-nowrap">{p.last_seen || "—"}</td>
+                    <td className="px-4 py-3 text-right"><button onClick={() => void deleteFingerprint(p)} disabled={deletingId === p.fingerprint_id} className="inline-flex items-center gap-1 px-2 py-1.5 text-xs rounded border border-rose-200 text-rose-700 hover:bg-rose-50 disabled:opacity-50"><Trash2 className="w-3.5 h-3.5" />{deletingId === p.fingerprint_id ? "Queueing…" : "Delete FP"}</button></td>
                   </tr>
                 ))}
               </tbody>
