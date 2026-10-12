@@ -1,3 +1,4 @@
+// Cloud-only mode: keep RTC sync queue servicing in the main loop.
 #include "app.h"
 #include <esp_system.h>
 #include "mbedtls/sha256.h"
