@@ -134,6 +134,7 @@ extern SystemLogEvent systemLogFallback[4];
 extern uint8_t systemLogFallbackCount;
 extern TaskHandle_t sdTaskHandle;
 extern bool pendingRestart;
+extern volatile bool factoryResetSdRequested, factoryResetSdDone, factoryResetSdOk;
 extern volatile bool bootSnapshotDirty;
 extern volatile bool dashboardBootReady;
 extern volatile bool attendanceBootReady;
