@@ -86,6 +86,10 @@ void CloudSyncClass::begin(const char* deviceId, const char* apiKey) {
     "HMUfpIBvFSDJ3gyICh3WZlXi/EjJKSZp4A==\n"
     "-----END CERTIFICATE-----\n";
 
+  // IMPORTANT: without a configured trust anchor, NetworkClientSecure::connect()
+  // returns -1 immediately (generic error) before opening the TLS socket.
+  // Pass the static PEM bundle to mbedTLS; certificate verification stays enabled.
+  _tls.setCACert(CLOUD_ROOT_CAS);
 }
 
 // ──────────────────────────────────────────────
