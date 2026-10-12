@@ -50,8 +50,8 @@ inline void unlockCloudSd() {
 #define CLOUD_HEARTBEAT_INTERVAL_MS 60000UL
 #define CLOUD_TIMEOUT_MS 15000UL
 #define CLOUD_BATCH_SIZE 10
-#define CLOUD_OUTBOX_MAX 64
-#define CLOUD_MAX_PENDING_CMDS 8
+#define CLOUD_OUTBOX_MAX 12  // RAM window only; remaining pending events stay on SD
+#define CLOUD_MAX_PENDING_CMDS 4  // extra commands remain pending on the server until a slot opens
 #define CLOUD_MAX_RETRIES 12
 #define CLOUD_OUTBOX_FILE "/cloud_outbox.csv"
 #define CLOUD_OUTBOX_TMP_FILE "/cloud_outbox.tmp"
