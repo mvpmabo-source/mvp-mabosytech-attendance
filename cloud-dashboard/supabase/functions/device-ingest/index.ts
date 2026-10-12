@@ -268,9 +268,9 @@ Deno.serve(async (req: Request) => {
         .slice(0, 5)
         .map(({ id, command, payload, created_at }) => ({ id, command, payload, created_at }));
 
-      if (pendingCommands.length > 0) {
-        console.log(`Delivering ${pendingCommands.length} pending command(s) to authenticated device ${device.device_id}`);
-      }
+      console.log(
+        `Heartbeat command poll: device_id=${device.device_id} database_id=${device.id} targets=${commandTargets.join(",")} pending=${pendingCommands.length}`
+      );
 
       return jsonOk({
         received: true,
