@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 
 static void handleCloudCommand(const char* commandId, const char* command, const char* payload);
+static void handleCloudSettings(const char* settingsJson);
 static char activeCloudEnrollCommandId[40] = "";
 
 void setup() {
@@ -140,6 +141,7 @@ void setup() {
 
   CloudSync.begin(CLOUD_DEVICE_ID, CLOUD_API_KEY);
   CloudSync.onCommand(handleCloudCommand);
+  CloudSync.onSettings(handleCloudSettings);
   if (CloudSync.isEnabled())
     addLog("INFO", -1, "Cloud sync enabled");
   else
@@ -471,6 +473,139 @@ void servicePendingRestart() {
 }
 
 
+static bool normalizeCloudTimezone(String requested, String& posixTimezone) {
+  requested.trim();
+  if (requested.length() == 0 || requested.length() > 64) return false;
+
+  // The ESP32 time API uses POSIX TZ strings rather than the full IANA database.
+  // Map the project's likely Rwanda/East-Africa settings explicitly.
+  if (requested.equalsIgnoreCase("Africa/Kigali") ||
+      requested.equalsIgnoreCase("Africa/Maputo") ||
+      requested.equalsIgnoreCase("Africa/Harare") ||
+      requested.equalsIgnoreCase("Africa/Lusaka") ||
+      requested.equalsIgnoreCase("Africa/Blantyre") ||
+      requested.equalsIgnoreCase("Africa/Bujumbura")) {
+    posixTimezone = "CAT-2";
+    return true;
+  }
+  if (requested.equalsIgnoreCase("Africa/Nairobi") ||
+      requested.equalsIgnoreCase("Africa/Kampala") ||
+      requested.equalsIgnoreCase("Africa/Dar_es_Salaam")) {
+    posixTimezone = "EAT-3";
+    return true;
+  }
+  if (requested.equalsIgnoreCase("UTC") || requested.equalsIgnoreCase("Etc/UTC")) {
+    posixTimezone = "UTC0";
+    return true;
+  }
+
+  // Accept explicit POSIX TZ strings (e.g. CAT-2 or CET-1CEST,M3.5.0/2,M10.5.0/3).
+  // Reject unknown IANA-style paths rather than silently applying the wrong offset.
+  if (requested.indexOf('/') >= 0 && requested.indexOf(',') < 0) return false;
+  bool hasLetter = false;
+  bool hasDigit = false;
+  for (size_t i = 0; i < requested.length(); ++i) {
+    const char ch = requested.charAt(i);
+    if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')) hasLetter = true;
+    else if (ch >= '0' && ch <= '9') hasDigit = true;
+    else if (ch != '+' && ch != '-' && ch != ',' && ch != '/' && ch != '.' && ch != ':') return false;
+  }
+  if (!hasLetter || !hasDigit) return false;
+  posixTimezone = requested;
+  return true;
+}
+
+static bool applyCloudSettingsDocument(JsonDocument& data, bool& changed, String& error) {
+  changed = false;
+  error = "";
+
+  const char* checkin = data["checkin_time"] | (data["check_in_time"] | "");
+  const char* checkout = data["checkout_time"] | (data["check_out_time"] | "");
+  String deviceName = data["device_name"] | (data["display_name"] | "");
+  deviceName.trim();
+  const char* timezoneRaw = data["timezone"] | (data["time_zone"] | "");
+
+  const bool hasCheckin = checkin && checkin[0];
+  const bool hasCheckout = checkout && checkout[0];
+  const bool hasName = deviceName.length() > 0;
+  const bool hasTimezone = timezoneRaw && timezoneRaw[0];
+
+  if (!hasCheckin && !hasCheckout && !hasName && !hasTimezone) {
+    error = "no_supported_settings_in_payload";
+    return false;
+  }
+
+  int checkinMinutes = -1;
+  int checkoutMinutes = -1;
+  if (hasCheckin) {
+    checkinMinutes = hhmmToMinutes(String(checkin));
+    if (checkinMinutes < 0 || checkinMinutes >= 1440) {
+      error = "invalid_checkin_time";
+      return false;
+    }
+  }
+  if (hasCheckout) {
+    checkoutMinutes = hhmmToMinutes(String(checkout));
+    if (checkoutMinutes < 0 || checkoutMinutes >= 1440) {
+      error = "invalid_checkout_time";
+      return false;
+    }
+  }
+  if (hasName && deviceName.length() > 48) {
+    error = "device_name_too_long";
+    return false;
+  }
+
+  String posixTimezone;
+  if (hasTimezone && !normalizeCloudTimezone(String(timezoneRaw), posixTimezone)) {
+    error = "unsupported_timezone_format";
+    return false;
+  }
+
+  if (!lockState(100)) {
+    error = "state_lock_unavailable";
+    return false;
+  }
+  if (hasCheckin && cfgCheckinMinutes != checkinMinutes) {
+    cfgCheckinMinutes = checkinMinutes;
+    changed = true;
+  }
+  if (hasCheckout && cfgCheckoutMinutes != checkoutMinutes) {
+    cfgCheckoutMinutes = checkoutMinutes;
+    changed = true;
+  }
+  if (hasName && cfgDeviceName != deviceName) {
+    cfgDeviceName = deviceName;
+    changed = true;
+  }
+  if (hasTimezone && cfgTimezone != posixTimezone) {
+    cfgTimezone = posixTimezone;
+    changed = true;
+  }
+  unlockState();
+
+  if (changed) deviceSetupPersistPending = true;
+  return true;
+}
+
+static void handleCloudSettings(const char* settingsJson) {
+  if (!settingsJson || !settingsJson[0]) return;
+  JsonDocument settings;
+  DeserializationError err = deserializeJson(settings, settingsJson);
+  if (err) {
+    Serial.printf("[CLOUD] Ignoring malformed heartbeat settings: %s\\n", err.c_str());
+    return;
+  }
+
+  bool changed = false;
+  String error;
+  if (!applyCloudSettingsDocument(settings, changed, error)) {
+    Serial.printf("[CLOUD] Heartbeat settings not applied: %s\\n", error.c_str());
+    return;
+  }
+  Serial.printf("[CLOUD] Heartbeat settings processed; changed=%s\\n", changed ? "yes" : "no");
+}
+
 static void handleCloudCommand(const char* commandId, const char* command, const char* payload) {
   if (!commandId || !command || !command[0]) return;
   JsonDocument data;
@@ -501,30 +636,17 @@ static void handleCloudCommand(const char* commandId, const char* command, const
 
   if (!strcmp(command, "update_settings")) {
     bool changed = false;
-    const char* checkin = data["checkin_time"] | "";
-    const char* checkout = data["checkout_time"] | "";
-    const char* name = data["device_name"] | "";
-    if (checkin[0]) {
-      int mins = hhmmToMinutes(String(checkin));
-      if (mins < 0 || mins >= 1440) {
-        CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"invalid_checkin_time\"}");
-        CloudSync.flushCommandAcks(); return;
-      }
-      cfgCheckinMinutes = mins; changed = true;
-    }
-    if (checkout[0]) {
-      int mins = hhmmToMinutes(String(checkout));
-      if (mins < 0 || mins >= 1440) {
-        CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"invalid_checkout_time\"}");
-        CloudSync.flushCommandAcks(); return;
-      }
-      cfgCheckoutMinutes = mins; changed = true;
-    }
-    if (name[0]) { cfgDeviceName = String(name); changed = true; }
-    if (changed) deviceSetupPersistPending = true;
-    CloudSync.completeCommand(commandId, changed,
-      changed ? "{\"ok\":true,\"message\":\"settings_applied\"}" :
-                "{\"ok\":false,\"error\":\"no_supported_settings_in_payload\"}");
+    String error;
+    const bool ok = applyCloudSettingsDocument(data, changed, error);
+
+    JsonDocument result;
+    result["ok"] = ok;
+    if (ok) result["message"] = changed ? "settings_applied" : "settings_already_current";
+    else result["error"] = error;
+
+    String resultJson;
+    serializeJson(result, resultJson);
+    CloudSync.completeCommand(commandId, ok, resultJson.c_str());
     CloudSync.flushCommandAcks();
     return;
   }
