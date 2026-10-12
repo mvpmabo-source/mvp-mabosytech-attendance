@@ -30,7 +30,14 @@ jobs:
           arduino-cli config init
           arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli core update-index
-          arduino-cli core install esp32:esp32@3.3.12
+          for attempt in 1 2 3; do
+            if arduino-cli core install esp32:esp32@3.3.12; then
+              exit 0
+            fi
+            echo "ESP32 core installation failed on attempt ${attempt}/3; retrying after a short delay."
+            sleep 10
+          done
+          exit 1
       - name: Install firmware libraries
         run: |
           arduino-cli lib install "Adafruit GFX Library"
