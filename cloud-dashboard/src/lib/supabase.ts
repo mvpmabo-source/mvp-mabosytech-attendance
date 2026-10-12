@@ -65,7 +65,7 @@ export type Device = {
 export type DeviceCommand = {
   id: string;
   device_id: string;
-  command: "restart" | "sync_time";
+  command: "restart" | "sync_time" | "enroll_fingerprint" | "delete_fingerprint" | "factory_reset";
   payload: Record<string, unknown>;
   status: "pending" | "acknowledged" | "failed";
   created_by: string | null;
