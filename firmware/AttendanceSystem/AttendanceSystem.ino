@@ -694,6 +694,21 @@ static void handleCloudCommand(const char* commandId, const char* command, const
   }
 
   if (!strcmp(command, "restart")) {
+    // Persist the command ID BEFORE scheduling reboot. If its ACK is lost,
+    // the cloud may redeliver it after reboot; recognize that duplicate and
+    // ACK it without restarting a second time.
+    const String previousRestartId = prefsGetString("last_restart_cmd", "");
+    if (previousRestartId == String(commandId)) {
+      Serial.printf("[CLOUD] Duplicate restart command %s; ACK only, no reboot.\\n", commandId);
+      CloudSync.completeCommand(commandId, true, "{\"ok\":true,\"message\":\"restart_already_executed\"}");
+      CloudSync.flushCommandAcks();
+      return;
+    }
+    if (!prefsPutString("last_restart_cmd", String(commandId))) {
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"restart_guard_persist_failed\"}");
+      CloudSync.flushCommandAcks();
+      return;
+    }
     CloudSync.completeCommand(commandId, true, "{\"ok\":true,\"message\":\"restart_scheduled\"}");
     CloudSync.flushCommandAcks();
     requestRestart(false);
@@ -758,16 +773,24 @@ static void handleCloudCommand(const char* commandId, const char* command, const
       CloudSync.flushCommandAcks(); return;
     }
     uint8_t result = finger.deleteModel(id);
-    unlockFinger();
+    // Do not trust the delete ACK alone: query the same slot again and only
+    // remove cloud/local metadata after the sensor confirms it is empty.
+    uint8_t verify = 0xFF;
     if (result == FINGERPRINT_OK) {
+      delay(10);
+      verify = finger.loadModel((uint16_t)id);
+    }
+    unlockFinger();
+    if (result == FINGERPRINT_OK && verify == CLOUD_FP_SLOT_EMPTY_CODE) {
       deleteProfile((uint16_t)id);
       clearPresenceState((uint16_t)id);
       removeRegisteredEntry((uint16_t)id);
       refreshTemplateCountCache();
       if (nextEnrollID == 0 || id < nextEnrollID) nextEnrollID = (uint16_t)id;
-      CloudSync.completeCommand(commandId, true, "{\"ok\":true,\"message\":\"fingerprint_deleted\"}");
+      CloudSync.completeCommand(commandId, true, "{\"ok\":true,\"message\":\"fingerprint_deleted_and_verified\"}");
     } else {
-      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"sensor_delete_failed\"}");
+      Serial.printf("[FP] Delete ID %d not confirmed: delete=0x%02X verify=0x%02X\\n", id, result, verify);
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"sensor_delete_not_verified\"}");
     }
     CloudSync.flushCommandAcks();
     return;
