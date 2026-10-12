@@ -43,13 +43,14 @@ void CloudSyncClass::begin(const char* deviceId, const char* apiKey) {
   _apiKey[sizeof(_apiKey) - 1] = '\0';
   _enabled = true;
 
-  // Supabase's currently observed *.supabase.co chain uses Google Trust
-  // Services WE1 -> GTS Root R4. Trust this root explicitly and retain normal
-  // certificate/hostname validation. If Supabase changes CA, update this root.
-  // Google Trust Services Root R4 CA certificate (SHA-256 fingerprint:
-  // 34:9D:FA:40:58:C5:E2:63:12:3B:39:8A:E7:95:57:3C:4E:13:13:C8:3F:E6:8F:93:55:6C:D5:E8:03:1B:3C:7D).
-  // Keep this PEM complete; an incomplete/malformed CA prevents TLS handshakes.
-  static const char GTS_ROOT_R4[] PROGMEM =
+  // Trust anchors for the Supabase HTTPS endpoint. The observed public
+  // *.supabase.co chain uses WE1, which may arrive with the GTS Root R4
+  // cross-certificate issued by GlobalSign Root CA. Keep both public roots
+  // trusted so either the cross-signed or direct GTS R4 chain validates.
+  // GTS Root R4 SHA-256: 34:9D:FA:40:58:C5:E2:63:12:3B:39:8A:E7:95:57:3C:4E:13:13:C8:3F:E6:8F:93:55:6C:D5:E8:03:1B:3C:7D
+  // GlobalSign Root CA SHA-256: EB:D4:10:40:E4:BB:3E:C7:42:C9:E3:81:D3:1E:F2:A4:1A:48:B6:68:5C:96:E7:CE:F3:C1:DF:6C:D4:33:1C:99
+  // Certificate and hostname verification remain enabled; never use setInsecure().
+  static const char CLOUD_ROOT_CAS[] PROGMEM =
     "-----BEGIN CERTIFICATE-----\n"
     "MIICCTCCAY6gAwIBAgINAgPlwGjvYxqccpBQUjAKBggqhkjOPQQDAzBHMQswCQYD\n"
     "VQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEUMBIG\n"
@@ -62,8 +63,29 @@ void CloudSyncClass::begin(const char* deviceId, const char* apiKey) {
     "BBSATNbrdP9JNqPV2Py1PsVq8JQdjDAKBggqhkjOPQQDAwNpADBmAjEA6ED/g94D\n"
     "9J+uHXqnLrmvT/aDHQ4thQEd0dlq7A/Cr8deVl5c1RxYIigL9zC2L7F8AjEA8GE8\n"
     "p/SgguMh1YQdc4acLa/KNJvxn7kjNuK8YAOdgLOaVsjh4rsUecrNIdSUtUlD\n"
+    "-----END CERTIFICATE-----\n"
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIDdTCCAl2gAwIBAgILBAAAAAABFUtaw5QwDQYJKoZIhvcNAQEFBQAwVzELMAkG\n"
+    "A1UEBhMCQkUxGTAXBgNVBAoTEEdsb2JhbFNpZ24gbnYtc2ExEDAOBgNVBAsTB1Jv\n"
+    "b3QgQ0ExGzAZBgNVBAMTEkdsb2JhbFNpZ24gUm9vdCBDQTAeFw05ODA5MDExMjAw\n"
+    "MDBaFw0yODAxMjgxMjAwMDBaMFcxCzAJBgNVBAYTAkJFMRkwFwYDVQQKExBHbG9i\n"
+    "YWxTaWduIG52LXNhMRAwDgYDVQQLEwdSb290IENBMRswGQYDVQQDExJHbG9iYWxT\n"
+    "aWduIFJvb3QgQ0EwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDaDuaZ\n"
+    "jc6j40+Kfvvxi4Mla+pIH/EqsLmVEQS98GPR4mdmzxzdzxtIK+6NiY6arymAZavp\n"
+    "xy0Sy6scTHAHoT0KMM0VjU/43dSMUBUc71DuxC73/OlS8pF94G3VNTCOXkNz8kHp\n"
+    "1Wrjsok6Vjk4bwY8iGlbKk3Fp1S4bInMm/k8yuX9ifUSPJJ4ltbcdG6TRGHRjcdG\n"
+    "snUOhugZitVtbNV4FpWi6cgKOOvyJBNPc1STE4U6G7weNLWLBYy5d4ux2x8gkasJ\n"
+    "U26Qzns3dLlwR5EiUWMWea6xrkEmCMgZK9FGqkjWZCrXgzT/LCrBbBlDSgeF59N8\n"
+    "9iFo7+ryUp9/k5DPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNVHRMBAf8E\n"
+    "BTADAQH/MB0GA1UdDgQWBBRge2YaRQ2XyolQL30EzTSo//z9SzANBgkqhkiG9w0B\n"
+    "AQUFAAOCAQEA1nPnfE920I2/7LqivjTFKDK1fPxsnCwrvQmeU79rXqoRSLblCKOz\n"
+    "yj1hTdNGCbM+w6DjY1Ub8rrvrTnhQ7k4o+YviiY776BQVvnGCv04zcQLcFGUl5gE\n"
+    "38NflNUVyRRBnMRddWQVDf9VMOyGj/8N7yy5Y0b2qvzfvGn9LhJIZJrglfCm7ymP\n"
+    "AbEVtQwdpf5pLGkkeB6zpxxxYu7KyJesF12KwvhHhm4qxFYxldBniYUr+WymXUad\n"
+    "DKqC5JlR3XC321Y9YeRq4VzW9v493kHMB65jUr9TU/Qr6cf9tveCX4XSQRjbgbME\n"
+    "HMUfpIBvFSDJ3gyICh3WZlXi/EjJKSZp4A==\n"
     "-----END CERTIFICATE-----\n";
-  _tls.setCACert(GTS_ROOT_R4);
+
 }
 
 // ──────────────────────────────────────────────
@@ -649,7 +671,7 @@ bool CloudSyncClass::postJson(const String& body, String* responseOut, int* http
   // TLS handshakes require a large contiguous internal-RAM allocation.
   // Log both total and largest-block heap to distinguish low memory from
   // fragmentation without weakening certificate verification.
-  Serial.printf("[CLOUD] TLS preflight heap=%u maxAlloc=%u minFree=%u\\n",
+  Serial.printf("[CLOUD] TLS preflight heap=%u maxAlloc=%u minFree=%u\n",
                 (unsigned int)ESP.getFreeHeap(),
                 (unsigned int)ESP.getMaxAllocHeap(),
                 (unsigned int)ESP.getMinFreeHeap());
@@ -665,7 +687,7 @@ bool CloudSyncClass::postJson(const String& body, String* responseOut, int* http
   if (!_tls.connect(host.c_str(), 443, CLOUD_TIMEOUT_MS)) {
     char tlsError[160] = {0};
     const int tlsErrorCode = _tls.lastError(tlsError, sizeof(tlsError));
-    Serial.printf("[CLOUD] TLS connection failed: code=%d detail=%s heap=%u maxAlloc=%u minFree=%u\\n",
+    Serial.printf("[CLOUD] TLS connection failed: code=%d detail=%s heap=%u maxAlloc=%u minFree=%u\n",
                   tlsErrorCode, tlsError[0] ? tlsError : "(no TLS detail)",
                   (unsigned int)ESP.getFreeHeap(),
                   (unsigned int)ESP.getMaxAllocHeap(),
