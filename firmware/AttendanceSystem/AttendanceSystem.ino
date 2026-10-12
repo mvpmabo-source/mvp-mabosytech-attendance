@@ -238,6 +238,11 @@ void loop() {
       oledErrorAnimation("DATABASE FULL", "Delete a record");
       smartDelay(1500);
       if (lockState()) { pendingName=pendingCollegeId=pendingRole=pendingDepartment=pendingNote=""; isEnrolling=false; unlockState(); }
+      if (activeCloudEnrollCommandId[0]) {
+        CloudSync.completeCommand(activeCloudEnrollCommandId, false, "{\"ok\":false,\"error\":\"fingerprint_database_full\"}");
+        activeCloudEnrollCommandId[0] = '\0';
+        CloudSync.flushCommandAcks();
+      }
       oledScanScreen();
     } else {
       addLog("ENROLL", -1, eName.length()>0 ? ("Enrollment started for " + eName) : "Enrollment started");
