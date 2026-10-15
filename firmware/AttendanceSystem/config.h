@@ -1,6 +1,12 @@
 #pragma once
 #include "secrets_local.h"  // local-only credentials; never commit this file
 
+// This branch is deployed in cloud-only mode: SD/cloud are the durable history.
+// Keep the RAM log ring small so TLS certificate verification retains internal RAM.
+#ifndef CLOUD_ONLY_MODE
+#define CLOUD_ONLY_MODE 1
+#endif
+
 // Hardware / network configuration preserved from the verified source.
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -42,7 +48,11 @@
 #define ATTENDANCE_DEBOUNCE_MS 8000UL
 #define MATCH_SECURITY_LEVEL 2
 #define MAX_FINGERPRINTS 200
-#define MAX_LOGS 200
+#if CLOUD_ONLY_MODE
+#define MAX_LOGS 32   // transient RAM log ring; complete history remains on SD/cloud
+#else
+#define MAX_LOGS 200  // full local-dashboard history cache
+#endif
 #define MAX_PENDING 32
 #define CHECKIN_ON_TIME_MINUTES 475
 #define CHECKOUT_ON_TIME_MINUTES 1020
