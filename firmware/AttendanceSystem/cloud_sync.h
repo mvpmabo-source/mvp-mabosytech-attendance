@@ -49,7 +49,7 @@ inline void unlockCloudSd() {
 #define CLOUD_SYNC_INTERVAL_MS 15000UL
 #define CLOUD_HEARTBEAT_INTERVAL_MS 60000UL
 #define CLOUD_TIMEOUT_MS 15000UL
-#define CLOUD_BATCH_SIZE 10
+#define CLOUD_BATCH_SIZE 5
 #define CLOUD_OUTBOX_MAX 12  // RAM window only; remaining pending events stay on SD
 #define CLOUD_MAX_PENDING_CMDS 4  // extra commands remain pending on the server until a slot opens
 #define CLOUD_MAX_RETRIES 12
@@ -84,6 +84,10 @@ struct CloudPendingCommand {
   bool ackReady;
   bool succeeded;
 };
+
+// A body builder runs only after the TLS handshake, keeping JSON allocations
+// away from peak certificate-verification memory use.
+typedef bool (*CloudJsonBodyBuilder)(String& body, const void* context);
 
 // The handler can complete immediately or keep a command pending until a
 // long-running operation (such as fingerprint enrollment) actually finishes.
@@ -136,7 +140,7 @@ private:
   int _pendingAckCount = 0;
 
   unsigned long _lastSyncMs = 0;
-  bool postJson(const String& body, String* responseOut, int* httpStatusOut);
+  bool postJson(CloudJsonBodyBuilder bodyBuilder, const void* builderContext, String* responseOut, int* httpStatusOut);
   void processOutbox();
   void generateEventUid(char* buf, size_t bufLen, const char* date, const char* timeStr, int fpId);
   void processHeartbeatResponse(const String& response);

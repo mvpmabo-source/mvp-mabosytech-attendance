@@ -25,6 +25,90 @@
 
 CloudSyncClass CloudSync;
 
+namespace {
+struct HeartbeatBodyContext {
+  const char* deviceId; const char* apiKey; const char* fwVersion; bool wifiOk;
+  const char* ip; int rssi; int freeHeap; bool sdOk; bool rtcOk; bool rtcValid;
+  int templates; int capacity; int entryCount; int exitCount; int pendingCount;
+  const char* checkinTime; const char* checkoutTime; const char* deviceName;
+  bool isEnrolling; bool fpOk;
+};
+struct CommandAckBodyContext { const char* deviceId; const char* apiKey; const CloudPendingCommand* ack; };
+struct BatchBodyContext {
+  const char* deviceId; const char* apiKey; const CloudOutboxItem* items;
+  const int* indices; int count;
+};
+
+bool serializeRequestBody(JsonDocument& doc, String& body) {
+  const size_t expected = measureJson(doc);
+  if (!body.reserve(expected)) {
+    Serial.printf("[CLOUD] Cannot reserve JSON request body (%u bytes).\\n", (unsigned int)expected);
+    return false;
+  }
+  const size_t written = serializeJson(doc, body);
+  if (written != expected) {
+    Serial.printf("[CLOUD] JSON request body incomplete: %u/%u bytes.\\n",
+                  (unsigned int)written, (unsigned int)expected);
+    return false;
+  }
+  return true;
+}
+
+bool buildHeartbeatBody(String& body, const void* opaque) {
+  const HeartbeatBodyContext& c = *static_cast<const HeartbeatBodyContext*>(opaque);
+  JsonDocument doc;
+  doc["type"] = "heartbeat"; doc["device_id"] = c.deviceId; doc["api_key"] = c.apiKey;
+  JsonObject hb = doc["heartbeat"].to<JsonObject>();
+  hb["firmware_version"] = c.fwVersion ? c.fwVersion : "";
+  hb["wifi_connected"] = c.wifiOk; hb["ip_address"] = c.ip ? c.ip : "";
+  hb["rssi"] = c.rssi; hb["free_heap"] = c.freeHeap; hb["sd_available"] = c.sdOk;
+  hb["rtc_available"] = c.rtcOk; hb["rtc_time_valid"] = c.rtcValid;
+  hb["templates"] = c.templates; hb["capacity"] = c.capacity;
+  hb["entry_count"] = c.entryCount; hb["exit_count"] = c.exitCount;
+  hb["pending_count"] = c.pendingCount;
+  hb["checkin_time"] = c.checkinTime ? c.checkinTime : "";
+  hb["checkout_time"] = c.checkoutTime ? c.checkoutTime : "";
+  hb["device_name"] = c.deviceName ? c.deviceName : "";
+  hb["is_enrolling"] = c.isEnrolling; hb["fingerprint_ok"] = c.fpOk;
+  return serializeRequestBody(doc, body);
+}
+
+bool buildCommandAckBody(String& body, const void* opaque) {
+  const CommandAckBodyContext& c = *static_cast<const CommandAckBodyContext*>(opaque);
+  JsonDocument doc;
+  doc["type"] = "ack_command"; doc["device_id"] = c.deviceId; doc["api_key"] = c.apiKey;
+  doc["command_id"] = c.ack->id;
+  doc["ack_status"] = c.ack->succeeded ? "acknowledged" : "failed";
+  JsonDocument resultDoc;
+  if (deserializeJson(resultDoc, c.ack->result) == DeserializationError::Ok)
+    doc["result"] = resultDoc.as<JsonVariant>();
+  else
+    doc["result"] = c.ack->result;
+  return serializeRequestBody(doc, body);
+}
+
+bool buildBatchBody(String& body, const void* opaque) {
+  const BatchBodyContext& c = *static_cast<const BatchBodyContext*>(opaque);
+  JsonDocument doc;
+  doc["type"] = "batch"; doc["device_id"] = c.deviceId; doc["api_key"] = c.apiKey;
+  JsonArray events = doc["events"].to<JsonArray>();
+  for (int j = 0; j < c.count; ++j) {
+    const CloudOutboxItem& item = c.items[c.indices[j]];
+    JsonObject evt = events.add<JsonObject>();
+    char eventUid[48];
+    snprintf(eventUid, sizeof(eventUid), "%s-%s-%s-%d",
+             c.deviceId, item.date, item.timeStr, (int)item.fingerprintId);
+    evt["event_uid"] = eventUid; evt["date"] = item.date; evt["time"] = item.timeStr;
+    evt["fingerprint_id"] = item.fingerprintId; evt["name"] = item.name;
+    evt["college_id"] = item.collegeId; evt["role"] = item.role;
+    evt["department"] = item.department; evt["event_type"] = item.eventType;
+    evt["status"] = item.status;
+  }
+  return serializeRequestBody(doc, body);
+}
+}  // namespace
+
+
 // ──────────────────────────────────────────────
 // Initialization
 // ──────────────────────────────────────────────
@@ -394,39 +478,15 @@ void CloudSyncClass::sendHeartbeat(
   // Send any pending command acks first
   sendCommandAcks();
 
-  String body;
-  {
-    JsonDocument doc;
-  doc["type"] = "heartbeat";
-  doc["device_id"] = _deviceId;
-  doc["api_key"] = _apiKey;
-
-  JsonObject hb = doc["heartbeat"].to<JsonObject>();
-  hb["firmware_version"] = fwVersion ? fwVersion : "";
-  hb["wifi_connected"] = wifiOk;
-  hb["ip_address"] = ip ? ip : "";
-  hb["rssi"] = rssi;
-  hb["free_heap"] = freeHeap;
-  hb["sd_available"] = sdOk;
-  hb["rtc_available"] = rtcOk;
-  hb["rtc_time_valid"] = rtcValid;
-  hb["templates"] = templates;
-  hb["capacity"] = capacity;
-  hb["entry_count"] = entryCount;
-  hb["exit_count"] = exitCount;
-  hb["pending_count"] = pendingCount;
-  hb["checkin_time"] = checkinTime ? checkinTime : "";
-  hb["checkout_time"] = checkoutTime ? checkoutTime : "";
-  hb["device_name"] = deviceName ? deviceName : "";
-  hb["is_enrolling"] = isEnrolling;
-  hb["fingerprint_ok"] = fpOk;
-
-    serializeJson(doc, body);
-  }
+  const HeartbeatBodyContext payload = {
+    _deviceId, _apiKey, fwVersion, wifiOk, ip, rssi, freeHeap, sdOk,
+    rtcOk, rtcValid, templates, capacity, entryCount, exitCount, pendingCount,
+    checkinTime, checkoutTime, deviceName, isEnrolling, fpOk
+  };
 
   String response;
   int httpStatus = 0;
-  if (postJson(body, &response, &httpStatus)) {
+  if (postJson(buildHeartbeatBody, &payload, &response, &httpStatus)) {
     processHeartbeatResponse(response);
   } else {
     Serial.printf("[CLOUD] Heartbeat failed (HTTP %d)\n", httpStatus);
@@ -559,25 +619,9 @@ void CloudSyncClass::sendCommandAcks() {
       writeIndex++;
       continue;
     }
-    String body;
-    {
-      JsonDocument doc;
-    doc["type"] = "ack_command";
-    doc["device_id"] = _deviceId;
-    doc["api_key"] = _apiKey;
-    doc["command_id"] = _pendingAcks[i].id;
-    doc["ack_status"] = _pendingAcks[i].succeeded ? "acknowledged" : "failed";
-    JsonDocument resultDoc;
-    if (deserializeJson(resultDoc, _pendingAcks[i].result) == DeserializationError::Ok) {
-      doc["result"] = resultDoc.as<JsonVariant>();
-    } else {
-      doc["result"] = _pendingAcks[i].result;
-    }
-
-      serializeJson(doc, body);
-    }
+    const CommandAckBodyContext payload = {_deviceId, _apiKey, &_pendingAcks[i]};
     int status = 0;
-    if (postJson(body, nullptr, &status) && status >= 200 && status < 300) {
+    if (postJson(buildCommandAckBody, &payload, nullptr, &status) && status >= 200 && status < 300) {
       Serial.printf("[CLOUD] Command ack sent id=%s status=%s\n", _pendingAcks[i].id,
                     _pendingAcks[i].succeeded ? "acknowledged" : "failed");
     } else {
@@ -658,39 +702,12 @@ void CloudSyncClass::processOutbox() {
 
   if (eligibleCount == 0) return;
 
-  // Build the batch JSON payload
-  String body;
-  {
-    JsonDocument doc;
-  doc["type"] = "batch";
-  doc["device_id"] = _deviceId;
-  doc["api_key"] = _apiKey;
-
-  JsonArray events = doc["events"].to<JsonArray>();
-  for (int j = 0; j < eligibleCount; j++) {
-    CloudOutboxItem& item = _outbox[eligibleIdx[j]];
-    JsonObject evt = events.add<JsonObject>();
-    char eventUid[48];
-    generateEventUid(eventUid, sizeof(eventUid), item.date, item.timeStr, item.fingerprintId);
-    evt["event_uid"] = eventUid;
-    evt["date"] = item.date;
-    evt["time"] = item.timeStr;
-    evt["fingerprint_id"] = item.fingerprintId;
-    evt["name"] = item.name;
-    evt["college_id"] = item.collegeId;
-    evt["role"] = item.role;
-    evt["department"] = item.department;
-    evt["event_type"] = item.eventType;
-    evt["status"] = item.status;
-  }
-
-    serializeJson(doc, body);
-  }
-
+  // Defer JSON allocation until after TLS verification to preserve contiguous RAM.
+  const BatchBodyContext payload = {_deviceId, _apiKey, _outbox, eligibleIdx, eligibleCount};
   String response;
   int httpStatus = 0;
 
-  if (postJson(body, &response, &httpStatus)) {
+  if (postJson(buildBatchBody, &payload, &response, &httpStatus)) {
     // Parse the server response to confirm acceptance
     bool serverConfirmed = false;
     int acceptedCount = 0;
@@ -755,7 +772,7 @@ void CloudSyncClass::processOutbox() {
 // POST JSON with proper HTTP parsing
 // ──────────────────────────────────────────────
 
-bool CloudSyncClass::postJson(const String& body, String* responseOut, int* httpStatusOut) {
+bool CloudSyncClass::postJson(CloudJsonBodyBuilder bodyBuilder, const void* builderContext, String* responseOut, int* httpStatusOut) {
   // TLS handshakes require a large contiguous internal-RAM allocation.
   // Log both total and largest-block heap to distinguish low memory from
   // fragmentation without weakening certificate verification.
@@ -766,8 +783,8 @@ bool CloudSyncClass::postJson(const String& body, String* responseOut, int* http
                 (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                 (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 
-  // Parse the URL into stack buffers to avoid allocating temporary Strings
-  // immediately before mbedTLS performs RSA/X.509 verification.
+  // Parse the URL into stack buffers and defer payload allocations until after
+  // mbedTLS completes RSA/X.509 verification.
   const char* baseUrl = CLOUD_BASE_URL;
   if (strncmp(baseUrl, "https://", 8) != 0) {
     Serial.println("[CLOUD] TLS URL rejected: HTTPS is required.");
@@ -790,7 +807,9 @@ bool CloudSyncClass::postJson(const String& body, String* responseOut, int* http
   if (pathStart) memcpy(path, pathStart, strlen(pathStart) + 1);
   else strcpy(path, "/");
 
-  // Connect with TLS certificate validation (no setInsecure)
+  // Connect with TLS certificate validation (no setInsecure). Log only the host,
+  // never credentials or the full request URL.
+  Serial.printf("[CLOUD] TLS target host=%s port=443\\n", host);
   if (!_tls.connect(host, 443, CLOUD_TIMEOUT_MS)) {
     char tlsError[160] = {0};
     const int tlsErrorCode = _tls.lastError(tlsError, sizeof(tlsError));
@@ -801,6 +820,7 @@ bool CloudSyncClass::postJson(const String& body, String* responseOut, int* http
                   (unsigned int)ESP.getMinFreeHeap(),
                   (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                   (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    _tls.stop();  // Release any partial handshake state before the next retry.
     if (httpStatusOut) *httpStatusOut = 0;
     return false;
   }
@@ -808,6 +828,18 @@ bool CloudSyncClass::postJson(const String& body, String* responseOut, int* http
   // Verify the TLS connection is actually established with a valid cert
   if (!_tls.connected()) {
     Serial.println("[CLOUD] TLS connection dropped after handshake");
+    _tls.stop();
+    if (httpStatusOut) *httpStatusOut = 0;
+    return false;
+  }
+
+  Serial.printf("[CLOUD] TLS connected; building request heap=%u maxAlloc=%u\\n",
+                (unsigned int)ESP.getFreeHeap(),
+                (unsigned int)ESP.getMaxAllocHeap());
+  String body;
+  if (!bodyBuilder || !bodyBuilder(body, builderContext)) {
+    Serial.println("[CLOUD] JSON request body could not be built after TLS handshake.");
+    _tls.stop();
     if (httpStatusOut) *httpStatusOut = 0;
     return false;
   }
