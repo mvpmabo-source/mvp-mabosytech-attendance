@@ -1212,7 +1212,8 @@ void scanSdHistoryOnBootTask() {
         if (checkIn) { entries++; lastEntry=id; }
         else { exits++; }
 
-        if (todayDate.length()==10 && fields[0] == todayDate) {
+        // Cloud-only firmware keeps durable history on SD/cloud; rebuilding per-row String objects here fragments internal RAM needed by TLS. Counters above are still computed from every valid SD row.
+        if (!CLOUD_ONLY_MODE && todayDate.length()==10 && fields[0] == todayDate) {
           const String statusDisplay = attendanceStatusDisplayOf(fields[8]);
           const String eventText = (checkIn ? "CHECK IN - " : "CHECK OUT - ") + statusDisplay;
           const String combinedTime = fields[0] + " " + fields[1];
