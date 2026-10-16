@@ -1,53 +1,29 @@
 import { useEffect, useState, useMemo } from "react";
 import { CalendarCheck, Search, ChevronLeft, ChevronRight, Download, Filter, X } from "lucide-react";
-import { supabase, type AttendanceEvent, STATUS_LABELS, STATUS_COLORS, EVENT_LABELS } from "@/lib/supabase";
+import { supabase, type AttendanceEvent, type Teacher, STATUS_LABELS, STATUS_COLORS, EVENT_LABELS } from "@/lib/supabase";
 import { Card, LoadingSpinner, EmptyState, ErrorState, Badge } from "@/components/ui";
-
 
 const PAGE_SIZE = 25;
 
-type TeacherProfile = {
-  fingerprint_id: number;
-  name: string | null;
-  college_id: string | null;
-  role: string | null;
-  department: string | null;
-};
+type TeacherMap = Map<number, Teacher>;
 
-function isBlank(value: string | null | undefined): boolean {
-  const text = (value ?? "").trim();
-  return !text || text === "-" || text === "—";
+function isGenericName(name: string): boolean {
+  return !name || name.trim() === "" || /^ID\s+\d+$/i.test(name.trim());
 }
 
-function isGenericName(value: string | null | undefined, fingerprintId: number): boolean {
-  const text = (value ?? "").trim();
-  return isBlank(text) || new RegExp("^ID\\s*" + fingerprintId + "$", "i").test(text);
-}
-
-function enrichVisibleAttendance(events: AttendanceEvent[], profiles: TeacherProfile[]): AttendanceEvent[] {
-  const byFingerprintId = new Map<number, TeacherProfile>();
-  for (const profile of profiles) byFingerprintId.set(Number(profile.fingerprint_id), profile);
-
-  return events.map((event) => {
-    const profile = byFingerprintId.get(Number(event.fingerprint_id));
-    if (!profile) return event;
-
-    return {
-      ...event,
-      name: isGenericName(event.name, event.fingerprint_id) && !isBlank(profile.name)
-        ? profile.name!.trim()
-        : event.name,
-      college_id: isBlank(event.college_id) && !isBlank(profile.college_id)
-        ? profile.college_id!.trim()
-        : event.college_id,
-      role: isBlank(event.role) && !isBlank(profile.role)
-        ? profile.role!.trim()
-        : event.role,
-      department: isBlank(event.department) && !isBlank(profile.department)
-        ? profile.department!.trim()
-        : event.department,
-    };
-  });
+function enrichEvent(e: AttendanceEvent, teachers: TeacherMap): AttendanceEvent {
+  if (!isGenericName(e.name) && e.college_id && e.role && e.department) {
+    return e;
+  }
+  const t = teachers.get(e.fingerprint_id);
+  if (!t) return e;
+  return {
+    ...e,
+    name: isGenericName(e.name) ? t.name : e.name,
+    college_id: e.college_id || t.college_id,
+    role: e.role || t.role,
+    department: e.department || t.department,
+  };
 }
 
 export function AttendancePage() {
@@ -61,6 +37,7 @@ export function AttendancePage() {
   const [typeFilter, setTypeFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [showFilters, setShowFilters] = useState(false);
+  const [teachers, setTeachers] = useState<TeacherMap>(new Map());
 
   const from = page * PAGE_SIZE;
   const to = from + PAGE_SIZE - 1;
@@ -70,39 +47,32 @@ export function AttendancePage() {
       setLoading(true);
       setError(null);
       try {
-        let query = supabase.from("attendance_events").select("*", { count: "exact" }).order("event_date", { ascending: false }).order("event_time", { ascending: false }).range(from, to);
-        if (dateFilter) query = query.eq("event_date", dateFilter);
-        if (typeFilter) query = query.eq("event_type", typeFilter);
-        if (statusFilter) query = query.eq("status", statusFilter);
-        const { data, error: qErr, count } = await query;
-        if (qErr) throw new Error(qErr.message);
+        const [attendanceQuery, teacherQuery] = await Promise.all([
+          (async () => {
+            let query = supabase
+              .from("attendance_events")
+              .select("*", { count: "exact" })
+              .order("event_date", { ascending: false })
+              .order("event_time", { ascending: false })
+              .range(from, to);
+            if (dateFilter) query = query.eq("event_date", dateFilter);
+            if (typeFilter) query = query.eq("event_type", typeFilter);
+            if (statusFilter) query = query.eq("status", statusFilter);
+            return query;
+          })(),
+          supabase.from("teachers").select("*"),
+        ]);
 
-        // Fill missing/generic fields only for fingerprint IDs on this page.
-        // If teacher lookup fails, attendance remains visible with original values.
-        const rawEvents = (data as AttendanceEvent[]) ?? [];
-        const idsToEnrich = [...new Set(rawEvents
-          .filter((event) =>
-            isGenericName(event.name, event.fingerprint_id) ||
-            isBlank(event.college_id) ||
-            isBlank(event.role) ||
-            isBlank(event.department))
-          .map((event) => event.fingerprint_id))];
+        const [attResult, teacherResult] = await Promise.all([attendanceQuery, teacherQuery]);
+        if (attResult.error) throw new Error(attResult.error.message);
 
-        let profiles: TeacherProfile[] = [];
-        if (idsToEnrich.length > 0) {
-          const { data: teacherData, error: teacherErr } = await supabase
-            .from("teachers")
-            .select("fingerprint_id, name, college_id, role, department")
-            .in("fingerprint_id", idsToEnrich);
-          if (teacherErr) {
-            console.warn("Could not enrich attendance rows from teacher profiles:", teacherErr.message);
-          } else {
-            profiles = (teacherData as TeacherProfile[] | null) ?? [];
-          }
+        const teacherMap = new Map<number, Teacher>();
+        for (const t of (teacherResult.data as Teacher[]) ?? []) {
+          teacherMap.set(t.fingerprint_id, t);
         }
-
-        setEvents(enrichVisibleAttendance(rawEvents, profiles));
-        setTotal(count ?? 0);
+        setTeachers(teacherMap);
+        setEvents((attResult.data as AttendanceEvent[]) ?? []);
+        setTotal(attResult.count ?? 0);
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load attendance records");
       } finally {
@@ -113,16 +83,28 @@ export function AttendancePage() {
   }, [from, to, dateFilter, typeFilter, statusFilter]);
 
   const filteredEvents = useMemo(() => {
-    if (!search.trim()) return events;
+    const enriched = events.map((e) => enrichEvent(e, teachers));
+    if (!search.trim()) return enriched;
     const q = search.toLowerCase();
-    return events.filter((e) => e.name.toLowerCase().includes(q) || e.college_id.toLowerCase().includes(q) || e.department.toLowerCase().includes(q) || String(e.fingerprint_id).includes(q));
-  }, [events, search]);
+    return enriched.filter(
+      (e) =>
+        e.name.toLowerCase().includes(q) ||
+        e.college_id.toLowerCase().includes(q) ||
+        e.department.toLowerCase().includes(q) ||
+        String(e.fingerprint_id).includes(q)
+    );
+  }, [events, search, teachers]);
 
   const totalPages = Math.ceil(total / PAGE_SIZE);
 
   const handleExport = () => {
     const header = "date,time,fingerprint_id,name,college_id,role,department,event_type,status\n";
-    const rows = filteredEvents.map((e) => `${e.event_date},${e.event_time},${e.fingerprint_id},"${e.name}","${e.college_id}","${e.role}","${e.department}",${e.event_type},${e.status}`).join("\n");
+    const rows = filteredEvents
+      .map(
+        (e) =>
+          `${e.event_date},${e.event_time},${e.fingerprint_id},"${e.name}","${e.college_id}","${e.role}","${e.department}",${e.event_type},${e.status}`
+      )
+      .join("\n");
     const blob = new Blob([header + rows], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -132,67 +114,131 @@ export function AttendancePage() {
     URL.revokeObjectURL(url);
   };
 
-  const clearFilters = () => { setDateFilter(""); setTypeFilter(""); setStatusFilter(""); setSearch(""); setPage(0); };
+  const clearFilters = () => {
+    setDateFilter("");
+    setTypeFilter("");
+    setStatusFilter("");
+    setSearch("");
+    setPage(0);
+  };
+
   const hasFilters = dateFilter || typeFilter || statusFilter || search;
 
   return (
     <div className="space-y-4">
+      {/* Toolbar */}
       <div className="flex flex-col sm:flex-row gap-3 items-start sm:items-center justify-between">
         <div className="flex items-center gap-3 flex-1 min-w-0">
           <div className="relative flex-1 max-w-xs">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
-            <input type="text" placeholder="Search name, ID, dept..." value={search} onChange={(e) => setSearch(e.target.value)} className="w-full pl-10 pr-4 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500" />
+            <input
+              type="text"
+              placeholder="Search name, ID, dept..."
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              className="w-full pl-10 pr-4 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500"
+            />
           </div>
-          <button onClick={() => setShowFilters(!showFilters)} className={`flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-lg border transition-colors ${showFilters || hasFilters ? "border-teal-500 text-teal-600 bg-teal-50" : "border-slate-200 text-slate-600 hover:bg-slate-50"}`}>
-            <Filter className="w-4 h-4" />Filters
+          <button
+            onClick={() => setShowFilters(!showFilters)}
+            className={`flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-lg border transition-colors ${
+              showFilters || hasFilters
+                ? "border-teal-500 text-teal-600 bg-teal-50"
+                : "border-slate-200 text-slate-600 hover:bg-slate-50"
+            }`}
+          >
+            <Filter className="w-4 h-4" />
+            Filters
           </button>
         </div>
-        <button onClick={handleExport} disabled={filteredEvents.length === 0} className="flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-50 transition-colors">
-          <Download className="w-4 h-4" />Export CSV
+        <button
+          onClick={handleExport}
+          disabled={filteredEvents.length === 0}
+          className="flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-50 transition-colors"
+        >
+          <Download className="w-4 h-4" />
+          Export CSV
         </button>
       </div>
 
+      {/* Filter panel */}
       {showFilters && (
         <Card className="p-4">
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <div>
               <label className="block text-xs font-medium text-slate-500 mb-1">Date</label>
-              <input type="date" value={dateFilter} onChange={(e) => { setDateFilter(e.target.value); setPage(0); }} className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-teal-500" />
+              <input
+                type="date"
+                value={dateFilter}
+                onChange={(e) => { setDateFilter(e.target.value); setPage(0); }}
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-teal-500"
+              />
             </div>
             <div>
               <label className="block text-xs font-medium text-slate-500 mb-1">Event Type</label>
-              <select value={typeFilter} onChange={(e) => { setTypeFilter(e.target.value); setPage(0); }} className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-teal-500 bg-white">
-                <option value="">All</option><option value="CHECK_IN">Check In</option><option value="CHECK_OUT">Check Out</option>
+              <select
+                value={typeFilter}
+                onChange={(e) => { setTypeFilter(e.target.value); setPage(0); }}
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-teal-500 bg-white"
+              >
+                <option value="">All</option>
+                <option value="CHECK_IN">Check In</option>
+                <option value="CHECK_OUT">Check Out</option>
               </select>
             </div>
             <div>
               <label className="block text-xs font-medium text-slate-500 mb-1">Status</label>
-              <select value={statusFilter} onChange={(e) => { setStatusFilter(e.target.value); setPage(0); }} className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-teal-500 bg-white">
+              <select
+                value={statusFilter}
+                onChange={(e) => { setStatusFilter(e.target.value); setPage(0); }}
+                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-teal-500 bg-white"
+              >
                 <option value="">All</option>
-                {Object.entries(STATUS_LABELS).map(([val, label]) => (<option key={val} value={val}>{label}</option>))}
+                {Object.entries(STATUS_LABELS).map(([val, label]) => (
+                  <option key={val} value={val}>{label}</option>
+                ))}
               </select>
             </div>
           </div>
-          {hasFilters && <button onClick={clearFilters} className="mt-3 flex items-center gap-1 text-xs text-slate-500 hover:text-slate-700"><X className="w-3 h-3" />Clear all filters</button>}
+          {hasFilters && (
+            <button
+              onClick={clearFilters}
+              className="mt-3 flex items-center gap-1 text-xs text-slate-500 hover:text-slate-700"
+            >
+              <X className="w-3 h-3" />
+              Clear all filters
+            </button>
+          )}
         </Card>
       )}
 
+      {/* Table */}
       <Card className="overflow-hidden">
-        {loading ? <LoadingSpinner label="Loading attendance records..." /> : error ? <ErrorState message={error} /> : filteredEvents.length === 0 ? (
-          <EmptyState icon={<CalendarCheck className="w-7 h-7" />} title={hasFilters ? "No matching records" : "No attendance records yet"} description={hasFilters ? "Try adjusting your filters or search terms." : "Attendance events will appear here once your ESP32 device syncs them to the cloud."} />
+        {loading ? (
+          <LoadingSpinner label="Loading attendance records..." />
+        ) : error ? (
+          <ErrorState message={error} />
+        ) : filteredEvents.length === 0 ? (
+          <EmptyState
+            icon={<CalendarCheck className="w-7 h-7" />}
+            title={hasFilters ? "No matching records" : "No attendance records yet"}
+            description={hasFilters ? "Try adjusting your filters or search terms." : "Attendance events will appear here once your ESP32 device syncs them to the cloud."}
+          />
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
-              <thead><tr className="border-b border-slate-200 bg-slate-50">
-                <th className="text-left px-4 py-3 font-medium text-slate-600">Date</th>
-                <th className="text-left px-4 py-3 font-medium text-slate-600">Time</th>
-                <th className="text-left px-4 py-3 font-medium text-slate-600">ID</th>
-                <th className="text-left px-4 py-3 font-medium text-slate-600">Name</th>
-                <th className="text-left px-4 py-3 font-medium text-slate-600 hidden md:table-cell">College ID</th>
-                <th className="text-left px-4 py-3 font-medium text-slate-600 hidden lg:table-cell">Department</th>
-                <th className="text-left px-4 py-3 font-medium text-slate-600">Type</th>
-                <th className="text-left px-4 py-3 font-medium text-slate-600">Status</th>
-              </tr></thead>
+              <thead>
+                <tr className="border-b border-slate-200 bg-slate-50">
+                  <th className="text-left px-4 py-3 font-medium text-slate-600">Date</th>
+                  <th className="text-left px-4 py-3 font-medium text-slate-600">Time</th>
+                  <th className="text-left px-4 py-3 font-medium text-slate-600">ID</th>
+                  <th className="text-left px-4 py-3 font-medium text-slate-600">Name</th>
+                  <th className="text-left px-4 py-3 font-medium text-slate-600 hidden md:table-cell">College ID</th>
+                  <th className="text-left px-4 py-3 font-medium text-slate-600 hidden lg:table-cell">Department</th>
+                  <th className="text-left px-4 py-3 font-medium text-slate-600">Type</th>
+                  <th className="text-left px-4 py-3 font-medium text-slate-600">Status</th>
+                </tr>
+              </thead>
               <tbody className="divide-y divide-slate-100">
                 {filteredEvents.map((e) => (
                   <tr key={e.id} className="hover:bg-slate-50 transition-colors">
@@ -202,21 +248,47 @@ export function AttendancePage() {
                     <td className="px-4 py-3 text-slate-700 whitespace-nowrap">{e.name || `ID ${e.fingerprint_id}`}</td>
                     <td className="px-4 py-3 text-slate-500 hidden md:table-cell whitespace-nowrap">{e.college_id || "—"}</td>
                     <td className="px-4 py-3 text-slate-500 hidden lg:table-cell whitespace-nowrap">{e.department || "—"}</td>
-                    <td className="px-4 py-3 whitespace-nowrap"><Badge className={e.event_type === "CHECK_IN" ? "bg-emerald-50 text-emerald-700 border-emerald-200" : "bg-blue-50 text-blue-700 border-blue-200"}>{EVENT_LABELS[e.event_type] ?? e.event_type}</Badge></td>
-                    <td className="px-4 py-3 whitespace-nowrap"><Badge className={STATUS_COLORS[e.status] ?? "bg-slate-100 text-slate-600 border-slate-200"}>{STATUS_LABELS[e.status] ?? e.status}</Badge></td>
+                    <td className="px-4 py-3 whitespace-nowrap">
+                      <Badge className={e.event_type === "CHECK_IN" ? "bg-emerald-50 text-emerald-700 border-emerald-200" : "bg-blue-50 text-blue-700 border-blue-200"}>
+                        {EVENT_LABELS[e.event_type] ?? e.event_type}
+                      </Badge>
+                    </td>
+                    <td className="px-4 py-3 whitespace-nowrap">
+                      <Badge className={STATUS_COLORS[e.status] ?? "bg-slate-100 text-slate-600 border-slate-200"}>
+                        {STATUS_LABELS[e.status] ?? e.status}
+                      </Badge>
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
         )}
+
+        {/* Pagination */}
         {!loading && !error && total > PAGE_SIZE && (
           <div className="flex items-center justify-between px-4 py-3 border-t border-slate-200">
-            <p className="text-xs text-slate-500">Showing {from + 1}–{Math.min(from + filteredEvents.length, total)} of {total}</p>
+            <p className="text-xs text-slate-500">
+              Showing {from + 1}–{Math.min(from + filteredEvents.length, total)} of {total}
+            </p>
             <div className="flex items-center gap-2">
-              <button onClick={() => setPage(Math.max(0, page - 1))} disabled={page === 0} className="p-1.5 rounded-lg border border-slate-200 disabled:opacity-40 hover:bg-slate-50 transition-colors"><ChevronLeft className="w-4 h-4" /></button>
-              <span className="text-sm text-slate-600">Page {page + 1} / {totalPages}</span>
-              <button onClick={() => setPage(Math.min(totalPages - 1, page + 1))} disabled={page >= totalPages - 1} className="p-1.5 rounded-lg border border-slate-200 disabled:opacity-40 hover:bg-slate-50 transition-colors"><ChevronRight className="w-4 h-4" /></button>
+              <button
+                onClick={() => setPage(Math.max(0, page - 1))}
+                disabled={page === 0}
+                className="p-1.5 rounded-lg border border-slate-200 disabled:opacity-40 hover:bg-slate-50 transition-colors"
+              >
+                <ChevronLeft className="w-4 h-4" />
+              </button>
+              <span className="text-sm text-slate-600">
+                Page {page + 1} / {totalPages}
+              </span>
+              <button
+                onClick={() => setPage(Math.min(totalPages - 1, page + 1))}
+                disabled={page >= totalPages - 1}
+                className="p-1.5 rounded-lg border border-slate-200 disabled:opacity-40 hover:bg-slate-50 transition-colors"
+              >
+                <ChevronRight className="w-4 h-4" />
+              </button>
             </div>
           </div>
         )}
