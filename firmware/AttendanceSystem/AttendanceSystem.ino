@@ -664,10 +664,10 @@ static void handleCloudCommand(const char* commandId, const char* command, const
 
   if (!strcmp(command, "sync_time")) {
     uint32_t epoch = data["epoch"] | (data["unix_epoch"] | (data["timestamp"] | 0UL));
-    bool ok = epoch >= 1704067200UL && syncRTCFromBrowserEpoch(epoch);
+    const bool ok = epoch >= 1704067200UL && syncRTCFromCloudEpoch(epoch);
     CloudSync.completeCommand(commandId, ok,
-      ok ? "{\"ok\":true,\"message\":\"rtc_synced\"}" :
-           "{\"ok\":false,\"error\":\"invalid_epoch_or_rtc_sync_failed\"}");
+      ok ? "{\"ok\":true,\"message\":\"rtc_synced_and_verified\"}" :
+           "{\"ok\":false,\"error\":\"invalid_epoch_rtc_unavailable_or_verification_failed\"}");
     CloudSync.flushCommandAcks();
     return;
   }
