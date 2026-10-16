@@ -183,7 +183,7 @@ void serviceOTA(); bool otaInProgress();
 void setupTime(); void serviceBrowserTimeSync();
 void initializeRTC();
 void syncRTCFromNTP();
-bool syncRTCFromBrowserEpoch(uint32_t utcEpoch);
+bool syncRTCFromBrowserEpoch(uint32_t utcEpoch); bool syncRTCFromCloudEpoch(uint32_t utcEpoch);
 bool getCurrentDateTime(struct tm &outTimeinfo);
 String uptimeText(); String currentDateTimeText(); String currentDateOnlyText(); bool isValidDateStr(const String &s);
 String jsonEscape(String s); String firstNameOnly(String fullName); String getAttendanceStatus(bool isCheckIn); String formatBytes(uint64_t bytes);
