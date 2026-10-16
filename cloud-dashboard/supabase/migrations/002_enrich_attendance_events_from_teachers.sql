@@ -9,7 +9,7 @@ SET
     WHEN (
       NULLIF(BTRIM(a.name), '') IS NULL
       OR BTRIM(a.name) IN ('-', '—')
-      OR BTRIM(a.name) ~* ('^ID\\s*' || a.fingerprint_id::text || '$')
+      OR BTRIM(a.name) ~* ('^ID[[:space:]]*' || a.fingerprint_id::text || '$')
     )
     THEN COALESCE(NULLIF(BTRIM(t.name), ''), a.name)
     ELSE a.name
@@ -34,7 +34,7 @@ WHERE t.fingerprint_id = a.fingerprint_id
   AND (
     NULLIF(BTRIM(a.name), '') IS NULL
     OR BTRIM(a.name) IN ('-', '—')
-    OR BTRIM(a.name) ~* ('^ID\\s*' || a.fingerprint_id::text || '$')
+    OR BTRIM(a.name) ~* ('^ID[[:space:]]*' || a.fingerprint_id::text || '$')
     OR NULLIF(BTRIM(a.college_id), '') IS NULL
     OR BTRIM(a.college_id) IN ('-', '—')
     OR NULLIF(BTRIM(a.role), '') IS NULL
