@@ -102,7 +102,7 @@ function validateTimeString(s: string): boolean {
 
 
 function isGenericName(name: string): boolean {
-  return !name || name.trim() === "" || /^ID\\s*\\d+$/i.test(name.trim());
+  return !name || name.trim() === "" || /^ID\s*\d+$/i.test(name.trim());
 }
 
 // Best-effort enrichment by exact fingerprint ID. Never overwrite populated
