@@ -77,19 +77,31 @@ export function AttendancePage() {
         const { data, error: qErr, count } = await query;
         if (qErr) throw new Error(qErr.message);
 
-        // Fill missing/generic fields on old attendance rows from the authoritative
-        // teacher directory. This also improves rows created before device profile
-        // metadata was consistently present. If teacher lookup fails, attendance
-        // remains visible with its original values instead of failing the page.
-        const { data: teacherData, error: teacherErr } = await supabase
-          .from("teachers")
-          .select("fingerprint_id, name, college_id, role, department");
-        if (teacherErr) {
-          console.warn("Could not enrich attendance rows from teacher profiles:", teacherErr.message);
+        // Fill missing/generic fields only for fingerprint IDs on this page.
+        // If teacher lookup fails, attendance remains visible with original values.
+        const rawEvents = (data as AttendanceEvent[]) ?? [];
+        const idsToEnrich = [...new Set(rawEvents
+          .filter((event) =>
+            isGenericName(event.name, event.fingerprint_id) ||
+            isBlank(event.college_id) ||
+            isBlank(event.role) ||
+            isBlank(event.department))
+          .map((event) => event.fingerprint_id))];
+
+        let profiles: TeacherProfile[] = [];
+        if (idsToEnrich.length > 0) {
+          const { data: teacherData, error: teacherErr } = await supabase
+            .from("teachers")
+            .select("fingerprint_id, name, college_id, role, department")
+            .in("fingerprint_id", idsToEnrich);
+          if (teacherErr) {
+            console.warn("Could not enrich attendance rows from teacher profiles:", teacherErr.message);
+          } else {
+            profiles = (teacherData as TeacherProfile[] | null) ?? [];
+          }
         }
 
-        const profiles = (teacherData as TeacherProfile[] | null) ?? [];
-        setEvents(enrichVisibleAttendance((data as AttendanceEvent[]) ?? [], profiles));
+        setEvents(enrichVisibleAttendance(rawEvents, profiles));
         setTotal(count ?? 0);
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load attendance records");
