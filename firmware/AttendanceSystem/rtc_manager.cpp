@@ -146,6 +146,76 @@ void setupTime() {
   }
 }
 
+// Cloud command path: runs from the Arduino main loop, not an async HTTP
+// callback. Unlike the legacy browser queue, this path performs and verifies
+// the full DS3231 + system clock update before reporting command success.
+bool syncRTCFromCloudEpoch(uint32_t utcEpoch) {
+  if (utcEpoch < 1704067200UL || utcEpoch > 4102444800UL) {
+    Serial.printf("[RTC] Cloud sync rejected invalid UTC epoch: %lu\\n", (unsigned long)utcEpoch);
+    return false;
+  }
+
+  if (!rtcAvailable) {
+    Serial.println("[RTC] Cloud sync failed: DS3231 is unavailable.");
+    return false;
+  }
+
+  const time_t utc = (time_t)utcEpoch;
+  const time_t rwandaWallEpoch = utc + (time_t)RWANDA_UTC_OFFSET;
+  struct tm localTime{};
+  if (gmtime_r(&rwandaWallEpoch, &localTime) == nullptr ||
+      localTime.tm_year + 1900 < RTC_MIN_VALID_YEAR ||
+      localTime.tm_year + 1900 > 2099) {
+    Serial.println("[RTC] Cloud sync failed: UTC-to-Rwanda conversion invalid.");
+    return false;
+  }
+
+  if (rtcMutex && xSemaphoreTake(rtcMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    Serial.println("[RTC] Cloud sync failed: RTC mutex busy.");
+    return false;
+  }
+
+  rtc.adjust(DateTime(localTime.tm_year + 1900,
+                      localTime.tm_mon + 1,
+                      localTime.tm_mday,
+                      localTime.tm_hour,
+                      localTime.tm_min,
+                      localTime.tm_sec));
+  const DateTime written = rtc.now();
+  const bool rtcWriteVerified =
+      written.year() == localTime.tm_year + 1900 &&
+      written.month() == localTime.tm_mon + 1 &&
+      written.day() == localTime.tm_mday &&
+      written.hour() == localTime.tm_hour &&
+      written.minute() == localTime.tm_min &&
+      abs((int)written.second() - (int)localTime.tm_sec) <= 2;
+
+  if (rtcMutex) xSemaphoreGive(rtcMutex);
+
+  if (!rtcWriteVerified) {
+    Serial.println("[RTC] Cloud sync failed: DS3231 read-back verification did not match.");
+    return false;
+  }
+
+  if (!setSystemClockUtc(utc)) {
+    Serial.println("[RTC] Cloud sync failed: ESP32 system clock update failed.");
+    return false;
+  }
+
+  rtcTimeValid = true;
+  persistLastKnownUtc(utcEpoch);
+  bootSnapshotDirty = true;
+
+  Serial.printf("[RTC] Cloud sync verified Rwanda time: %04d-%02d-%02d %02d:%02d:%02d\\n",
+                localTime.tm_year + 1900,
+                localTime.tm_mon + 1,
+                localTime.tm_mday,
+                localTime.tm_hour,
+                localTime.tm_min,
+                localTime.tm_sec);
+  return true;
+}
+
 // Browser supplies UTC epoch.  HTTP callbacks MUST stay lightweight: the
 // actual DS3231/I2C, system-clock, and Preferences operations are performed by
 // loop() in serviceBrowserTimeSync(). The queue is length 1 and xQueueOverwrite()
