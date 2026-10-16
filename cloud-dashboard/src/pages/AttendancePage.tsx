@@ -1,9 +1,32 @@
 import { useEffect, useState, useMemo } from "react";
 import { CalendarCheck, Search, ChevronLeft, ChevronRight, Download, Filter, X } from "lucide-react";
-import { supabase, type AttendanceEvent, STATUS_LABELS, STATUS_COLORS, EVENT_LABELS } from "@/lib/supabase";
+import { supabase, type AttendanceEvent, type Teacher, STATUS_LABELS, STATUS_COLORS, EVENT_LABELS } from "@/lib/supabase";
 import { Card, LoadingSpinner, EmptyState, ErrorState, Badge } from "@/components/ui";
 
 const PAGE_SIZE = 25;
+
+type TeacherMap = Map<number, Teacher>;
+
+function isGenericName(name: string): boolean {
+  return !name || name.trim() === "" || /^ID\\s*\\d+$/i.test(name.trim());
+}
+
+function enrichEvent(event: AttendanceEvent, teachers: TeacherMap): AttendanceEvent {
+  const teacher = teachers.get(event.fingerprint_id);
+  if (!teacher) return event;
+  const genericName = isGenericName(event.name);
+  const needsCollegeId = !event.college_id || !event.college_id.trim() || ["-", "—"].includes(event.college_id.trim());
+  const needsRole = !event.role || !event.role.trim() || ["-", "—"].includes(event.role.trim());
+  const needsDepartment = !event.department || !event.department.trim() || ["-", "—"].includes(event.department.trim());
+  if (!genericName && !needsCollegeId && !needsRole && !needsDepartment) return event;
+  return {
+    ...event,
+    name: genericName ? (teacher.name || event.name) : event.name,
+    college_id: needsCollegeId ? (teacher.college_id || event.college_id) : event.college_id,
+    role: needsRole ? (teacher.role || event.role) : event.role,
+    department: needsDepartment ? (teacher.department || event.department) : event.department,
+  };
+}
 
 export function AttendancePage() {
   const [loading, setLoading] = useState(true);
@@ -16,6 +39,7 @@ export function AttendancePage() {
   const [typeFilter, setTypeFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [showFilters, setShowFilters] = useState(false);
+  const [teachers, setTeachers] = useState<TeacherMap>(new Map());
 
   const from = page * PAGE_SIZE;
   const to = from + PAGE_SIZE - 1;
@@ -33,6 +57,16 @@ export function AttendancePage() {
         if (qErr) throw new Error(qErr.message);
         setEvents((data as AttendanceEvent[]) ?? []);
         setTotal(count ?? 0);
+
+        // Profile lookup is best-effort: a teachers-table issue must not break attendance loading.
+        const { data: teacherRows, error: teacherError } = await supabase.from("teachers").select("*");
+        if (!teacherError && teacherRows) {
+          const teacherMap: TeacherMap = new Map();
+          for (const teacher of teacherRows as Teacher[]) {
+            teacherMap.set(teacher.fingerprint_id, teacher);
+          }
+          setTeachers(teacherMap);
+        }
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load attendance records");
       } finally {
@@ -43,10 +77,11 @@ export function AttendancePage() {
   }, [from, to, dateFilter, typeFilter, statusFilter]);
 
   const filteredEvents = useMemo(() => {
-    if (!search.trim()) return events;
+    const enriched = events.map((event) => enrichEvent(event, teachers));
+    if (!search.trim()) return enriched;
     const q = search.toLowerCase();
-    return events.filter((e) => e.name.toLowerCase().includes(q) || e.college_id.toLowerCase().includes(q) || e.department.toLowerCase().includes(q) || String(e.fingerprint_id).includes(q));
-  }, [events, search]);
+    return enriched.filter((e) => e.name.toLowerCase().includes(q) || e.college_id.toLowerCase().includes(q) || e.department.toLowerCase().includes(q) || String(e.fingerprint_id).includes(q));
+  }, [events, search, teachers]);
 
   const totalPages = Math.ceil(total / PAGE_SIZE);
 
