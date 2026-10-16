@@ -100,6 +100,51 @@ function validateTimeString(s: string): boolean {
   return /^\d{2}:\d{2}:\d{2}$/.test(s);
 }
 
+function isGenericName(name: string): boolean {
+  return !name || name.trim() === "" || /^ID\s+\d+$/i.test(name.trim());
+}
+
+// Best-effort profile enrichment from the teachers table. Fills only
+// missing/generic fields using an exact fingerprint_id match. Never
+// overwrites valid existing metadata. Never rejects an event.
+async function enrichFromTeachers(
+  fingerprintId: number,
+  name: string,
+  collegeId: string,
+  role: string,
+  department: string
+): Promise<{ name: string; college_id: string; role: string; department: string }> {
+  const needName = isGenericName(name);
+  const needCollege = !collegeId || collegeId.trim() === "";
+  const needRole = !role || role.trim() === "";
+  const needDept = !department || department.trim() === "";
+
+  if (!needName && !needCollege && !needRole && !needDept) {
+    return { name, college_id: collegeId, role, department };
+  }
+
+  try {
+    const { data, error } = await adminClient
+      .from("teachers")
+      .select("name, college_id, role, department")
+      .eq("fingerprint_id", fingerprintId)
+      .maybeSingle();
+
+    if (error || !data) {
+      return { name, college_id: collegeId, role, department };
+    }
+
+    return {
+      name: needName ? String(data.name || "") || name : name,
+      college_id: needCollege ? String(data.college_id || "") || collegeId : collegeId,
+      role: needRole ? String(data.role || "") || role : role,
+      department: needDept ? String(data.department || "") || department : department,
+    };
+  } catch {
+    return { name, college_id: collegeId, role, department };
+  }
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
@@ -149,6 +194,14 @@ Deno.serve(async (req: Request) => {
         return jsonError(400, "Invalid status value");
       }
 
+      const enriched = await enrichFromTeachers(
+        event.fingerprint_id,
+        event.name || "",
+        event.college_id || "",
+        event.role || "",
+        event.department || ""
+      );
+
       const { error: insertError } = await adminClient
         .from("attendance_events")
         .upsert(
@@ -158,10 +211,10 @@ Deno.serve(async (req: Request) => {
             event_date: event.date,
             event_time: event.time,
             fingerprint_id: event.fingerprint_id,
-            name: event.name || "",
-            college_id: event.college_id || "",
-            role: event.role || "",
-            department: event.department || "",
+            name: enriched.name,
+            college_id: enriched.college_id,
+            role: enriched.role,
+            department: enriched.department,
             event_type: event.event_type,
             status: event.status,
             synced_at: new Date().toISOString(),
@@ -217,9 +270,6 @@ Deno.serve(async (req: Request) => {
           .eq("device_id", deviceId);
       }
 
-      // Older dashboard builds have stored device_commands.device_id as either
-      // devices.device_id (human-readable ESP ID) or devices.id (database UUID).
-      // Resolve commands only against the authenticated device's own identifiers.
       const commandTargets = [...new Set([String(device.device_id), String(device.id)].filter(Boolean))];
       const pendingById = new Map<string, {
         id: string;
@@ -239,14 +289,12 @@ Deno.serve(async (req: Request) => {
           .limit(5);
 
         if (commandQueryError) {
-          // A UUID column rejects the text ESP ID; the UUID lookup below can still succeed.
           console.warn("Pending command lookup failed for one device identifier:", commandQueryError.message);
           continue;
         }
 
         successfulCommandLookup = true;
         for (const row of rows || []) {
-          // Never deliver rows not explicitly assigned to this authenticated device.
           if (!commandTargets.includes(String(row.device_id))) continue;
           if (!pendingById.has(String(row.id))) {
             pendingById.set(String(row.id), {
@@ -279,7 +327,6 @@ Deno.serve(async (req: Request) => {
         .maybeSingle();
 
       if (settingsError) {
-        // Commands must still be delivered even if the optional settings lookup fails.
         console.warn("Device settings lookup failed during heartbeat:", settingsError.message);
       }
 
@@ -294,10 +341,6 @@ Deno.serve(async (req: Request) => {
         device_name: settingsRow.device_name || "MABOSYTECH Attendance",
         timezone: settingsRow.timezone || "Africa/Kigali",
       } : null;
-
-      console.log(
-        `Heartbeat command poll: device_id=${device.device_id} database_id=${device.id} targets=${commandTargets.join(",")} pending=${pendingCommands.length}`
-      );
 
       return jsonOk({
         received: true,
@@ -323,16 +366,24 @@ Deno.serve(async (req: Request) => {
         if (!VALID_EVENT_TYPES.has(event.event_type)) continue;
         if (!VALID_STATUSES.has(event.status)) continue;
 
+        const enriched = await enrichFromTeachers(
+          event.fingerprint_id,
+          event.name || "",
+          event.college_id || "",
+          event.role || "",
+          event.department || ""
+        );
+
         rows.push({
           event_uid: event.event_uid,
           device_id: deviceId,
           event_date: event.date,
           event_time: event.time,
           fingerprint_id: event.fingerprint_id,
-          name: event.name || "",
-          college_id: event.college_id || "",
-          role: event.role || "",
-          department: event.department || "",
+          name: enriched.name,
+          college_id: enriched.college_id,
+          role: enriched.role,
+          department: enriched.department,
           event_type: event.event_type,
           status: event.status,
           synced_at: new Date().toISOString(),
@@ -361,9 +412,6 @@ Deno.serve(async (req: Request) => {
         return jsonError(400, "Missing command_id or invalid ack_status");
       }
 
-      // Resolve by command ID first, then verify ownership against both identifiers
-      // of the already-authenticated device. Using deviceId directly here breaks
-      // installations where device_commands.device_id is a foreign-key UUID.
       const { data: commandRow, error: commandLookupError } = await adminClient
         .from("device_commands")
         .select("id, device_id, command, payload, status")
@@ -382,8 +430,6 @@ Deno.serve(async (req: Request) => {
         return jsonError(403, "Command does not belong to this device");
       }
 
-      // A retry after a lost HTTP response is safe: if the same final status was
-      // already stored, acknowledge it idempotently instead of trapping the ESP queue.
       if (commandRow.status !== "pending") {
         if (commandRow.status === ackStatus) {
           return jsonOk({ acknowledged: true, already_processed: true });
@@ -409,8 +455,6 @@ Deno.serve(async (req: Request) => {
         updateData.payload = { ...payload, result };
       }
 
-      // The teachers table uses fingerprint_id as its primary key (not a UUID).
-      // Only mark enrolled when the firmware confirmed success for the requested slot.
       if (isEnrollment &&
           Number.isInteger(requestedFingerprintId) &&
           requestedFingerprintId >= 1 && requestedFingerprintId <= 200) {
@@ -419,12 +463,17 @@ Deno.serve(async (req: Request) => {
         if (ackStatus === "acknowledged" && resultOk && idMatches) {
           const { error: teacherError } = await adminClient
             .from("teachers")
-            .update({
+            .upsert({
+              fingerprint_id: requestedFingerprintId,
+              name: String(payload.name || ""),
+              college_id: String(payload.college_id || ""),
+              role: String(payload.role || "Teacher"),
+              department: String(payload.department || ""),
+              note: String(payload.note || ""),
               enrollment_status: "enrolled",
               enrolled_at: new Date().toISOString(),
               updated_at: new Date().toISOString(),
-            })
-            .eq("fingerprint_id", requestedFingerprintId);
+            }, { onConflict: "fingerprint_id" });
           if (teacherError) {
             console.error("Teacher enrollment status update failed:", teacherError.message);
           }
@@ -436,6 +485,30 @@ Deno.serve(async (req: Request) => {
           if (teacherError) {
             console.error("Teacher enrollment failure status update failed:", teacherError.message);
           }
+        }
+      }
+
+      const isDelete = ["delete_fingerprint", "delete_fingerprint_template"].includes(commandRow.command || "");
+      if (isDelete && ackStatus === "acknowledged" && result.ok === true) {
+        const deleteId = Number(payload.fingerprint_id || payload.template_id || 0);
+        if (Number.isInteger(deleteId) && deleteId >= 1 && deleteId <= 200) {
+          const { error: teacherDeleteError } = await adminClient
+            .from("teachers").delete().eq("fingerprint_id", deleteId);
+          if (teacherDeleteError) {
+            return jsonError(500, "Teacher delete failed after sensor confirmation", { detail: teacherDeleteError.message });
+          }
+        }
+      }
+
+      if (commandRow.command === "factory_reset" && ackStatus === "acknowledged" && result.ok === true) {
+        const deletions = await Promise.all([
+          adminClient.from("attendance_events").delete().eq("device_id", String(device.device_id)),
+          adminClient.from("device_heartbeats").delete().eq("device_id", String(device.device_id)),
+          adminClient.from("teachers").delete().neq("fingerprint_id", 0),
+        ]);
+        const failed = deletions.find((entry) => entry.error);
+        if (failed?.error) {
+          return jsonError(500, "Cloud clean-start cleanup failed", { detail: failed.error.message });
         }
       }
 
