@@ -8,7 +8,7 @@ const PAGE_SIZE = 25;
 type TeacherMap = Map<number, Teacher>;
 
 function isGenericName(name: string): boolean {
-  return !name || name.trim() === "" || /^ID\\s*\\d+$/i.test(name.trim());
+  return !name || name.trim() === "" || /^ID\s*\d+$/i.test(name.trim());
 }
 
 function enrichEvent(event: AttendanceEvent, teachers: TeacherMap): AttendanceEvent {
