@@ -322,9 +322,12 @@ bool AsyncWebServer::begin(){
   if(_server) return true;
   httpd_config_t cfg=HTTPD_DEFAULT_CONFIG();
   cfg.server_port=80;
-  cfg.max_uri_handlers=48;
-  cfg.max_open_sockets=7;
-  cfg.stack_size=8192;
+  // This manager-office device normally serves one browser. Keep enough
+  // slots for the dashboard's API polls/assets while avoiding excess heap
+  // pressure that prevents the cloud TLS handshake from allocating buffers.
+  cfg.max_uri_handlers=40; // 35 current routes + headroom
+  cfg.max_open_sockets=5;
+  cfg.stack_size=6144;
   cfg.task_priority=4;
   cfg.lru_purge_enable=true;
   if(httpd_start(&_server,&cfg)!=ESP_OK){ _server=nullptr; return false; }

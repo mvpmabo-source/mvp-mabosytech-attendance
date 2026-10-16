@@ -1,0 +1,2 @@
+# The active backend is managed by the Bolt project.
+# Do not deploy this function using Supabase CLI or a separate Supabase project.

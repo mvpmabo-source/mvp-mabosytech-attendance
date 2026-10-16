@@ -1,0 +1,50 @@
+name: ESP32 firmware build
+
+on:
+  push:
+    branches: [phase-3-firmware-cloud-sync]
+    paths:
+      - "firmware/AttendanceSystem/**"
+      - ".github/workflows/firmware-build.yml"
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: phase-3-firmware-cloud-sync
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Install ESP32 Arduino core
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.12
+      - name: Install firmware libraries
+        run: |
+          arduino-cli lib install "Adafruit GFX Library"
+          arduino-cli lib install "Adafruit SH110X"
+          arduino-cli lib install "Adafruit Fingerprint Sensor Library"
+          arduino-cli lib install "RTClib"
+          arduino-cli lib install "ArduinoJson"
+          arduino-cli lib install "ESP Async WebServer"
+          arduino-cli lib install "AsyncTCP"
+      - name: Provide placeholder local secrets for compilation
+        working-directory: firmware/AttendanceSystem
+        run: cp secrets.example.h secrets_local.h
+      - name: Compile ESP32 firmware
+        run: |
+          mkdir -p "$RUNNER_TEMP/firmware-build"
+          arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs --warnings all --output-dir "$RUNNER_TEMP/firmware-build" firmware/AttendanceSystem
+          ls -lah "$RUNNER_TEMP/firmware-build"
+          test -s "$RUNNER_TEMP/firmware-build/AttendanceSystem.ino.bin"
+
+      - name: Upload compiled ESP32 firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-firmware-${{ github.sha }}
+          path: ${{ runner.temp }}/firmware-build/*.bin
+          if-no-files-found: error
+          retention-days: 14

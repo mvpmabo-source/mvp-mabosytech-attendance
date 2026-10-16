@@ -27,6 +27,7 @@
 #include <ArduinoOTA.h>
 #include <esp_ota_ops.h>
 #include "config.h"
+#include "cloud_sync.h"
 
 // ---------- Core data types (single source of truth) ----------
 struct PersonProfile { String name, collegeId, role, department, note; };

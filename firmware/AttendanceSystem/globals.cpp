@@ -288,6 +288,7 @@ SemaphoreHandle_t fingerMutex;
 SemaphoreHandle_t ramLogSnapshotMutex;
 SemaphoreHandle_t rtcMutex;
 SemaphoreHandle_t authSessionMutex;
+SemaphoreHandle_t cloudSdMutex = nullptr;
 
 QueueHandle_t attendanceQueue;
 

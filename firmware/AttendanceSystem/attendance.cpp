@@ -10,18 +10,12 @@ bool splitDateTimeText(const String &timeText, String &outDate, String &outTime)
   return true;
 }
 
-// event is one of the free-form strings addLog() has always used, e.g.
-// "CHECK IN - LATE", "CHECK OUT - OVERTIME". Returns "CHECK_IN",
-// "CHECK_OUT", or "" if this is not an attendance event at all.
 String attendanceEventTypeOf(const String &event) {
   if (event.startsWith("CHECK IN"))  return "CHECK_IN";
   if (event.startsWith("CHECK OUT")) return "CHECK_OUT";
   return "";
 }
 
-// Maps the free-form attendance suffix onto the persisted status enum.
-// EARLY is intentionally kept as a distinct value so a check-in before
-// the on-time minute remains distinguishable in historical reports.
 String attendanceStatusEnumOf(const String &event) {
   String e = event; e.toUpperCase();
   if (e.indexOf("LEFT EARLY") >= 0) return "LEFT_EARLY";
@@ -32,8 +26,6 @@ String attendanceStatusEnumOf(const String &event) {
   return "ON_TIME";
 }
 
-// Inverse of attendanceStatusEnumOf(), used when reconstructing
-// historical CHECK IN / CHECK OUT events from attendance.csv.
 String attendanceStatusDisplayOf(const String &statusEnum) {
   if (statusEnum == "EARLY")       return "EARLY";
   if (statusEnum == "LEFT_EARLY") return "LEFT EARLY";
@@ -68,14 +60,6 @@ String buildSystemLogRow(const String &dateStr, const String &timeStr, const Str
   row += csvEscape(message);  row += "\n";
   return row;
 }
-
-// =====================================================
-// TRANSACTIONAL ATTENDANCE STORAGE
-// =====================================================
-// Critical attendance events are fail-closed. A CHECK IN/OUT is acknowledged
-// only after: valid time -> NVS journal -> SD write -> flush/close -> exact
-// read-back -> journal removal. This also gives a replay-safe recovery point
-// for a power loss between the SD write and the NVS cleanup.
 
 static int parseAttendanceCsvLine(const String &line, String fields[], int maxFields) {
   for (int i=0;i<maxFields;i++) fields[i]="";
@@ -138,10 +122,6 @@ bool persistAttendanceJournal(uint32_t seq,const String& row) {
   String payload; payload.reserve(380);
   payload += String(seq); payload += '\n'; payload += row;
   if(payload.length()>SD_JOURNAL_MAX_PAYLOAD) return false;
-
-  // Critical attendance uses a write-then-read verification. The generic
-  // Preferences helper only reports that it obtained the mutex, not that the
-  // underlying NVS write produced the expected value.
   if(!lockPrefs(1000)) return false;
   size_t written = prefs.putString(SD_ATTENDANCE_JOURNAL_KEY,payload);
   String verify = prefs.getString(SD_ATTENDANCE_JOURNAL_KEY,"");
@@ -150,8 +130,6 @@ bool persistAttendanceJournal(uint32_t seq,const String& row) {
     Serial.println("[SD] ERROR: attendance journal NVS write verification failed.");
     return false;
   }
-
-  // Keep the sequence monotonic across a reboot/recovery cycle.
   if(lockState(100)) {
     if(seq>logSeqCounter) logSeqCounter=seq;
     unlockState();
@@ -289,18 +267,10 @@ static bool applyAttendanceCommitState(const String& row,bool updateCounts) {
   bool checkIn=(f[7]=="CHECK_IN");
   bool checkOut=(f[7]=="CHECK_OUT");
   if(!checkIn && !checkOut) return false;
-
-  // Persist the desired presence first. The old implementation changed the
-  // in-memory state and incremented the counters before this NVS write. If
-  // NVS verification failed, a later retry could increment entryCount or
-  // exitCount again even though the SD row was already the same transaction.
-  // Writing the desired value first makes a failed persistence a clean retry
-  // with no counter mutation.
   if (!savePresenceStateValue((uint16_t)id, checkIn)) {
     Serial.printf("[ATTEND] ERROR: failed to persist presence state for ID %d; transaction retained.\n", id);
     return false;
   }
-
   const unsigned long nowMs=millis();
   if(!lockState(250)) return false;
   insideState[id]=checkIn;
@@ -308,17 +278,12 @@ static bool applyAttendanceCommitState(const String& row,bool updateCounts) {
   if(checkIn) { lastEntryId=id; if(updateCounts) entryCount++; }
   else if(checkOut && updateCounts) exitCount++;
   unlockState();
-
   updateRegisteredInsideCache((uint16_t)id, checkIn);
   return true;
 }
 
 bool finalizeAttendanceCommit(uint32_t seq,const String& row,bool recovery) {
   if(seq==0 || !validStoredAttendanceRow(row)) return false;
-
-  // Apply runtime state exactly once. Recovery rows are already included in
-  // the SD history that will be scanned at boot, so they update only the
-  // current inside/outside state and never increment totals here.
   if(!recovery) {
     if(attendanceStateAppliedSeq!=seq) {
       if(!applyAttendanceCommitState(row,true)) return false;
@@ -326,24 +291,14 @@ bool finalizeAttendanceCommit(uint32_t seq,const String& row,bool recovery) {
     }
   } else {
     if(!applyAttendanceCommitState(row,false)) return false;
-    // loadTodayFromSdToRam() runs before journal recovery at boot. If this
-    // journal row was not already present in SD, recovery adds it now. The
-    // authoritative boot scan skips the same recovered row when it later
-    // encounters it in attendance.csv.
     addRecoveredAttendanceToRam(row,seq);
   }
-
   markLogSaved(seq);
   if(clearAttendanceJournal()) {
     attendanceCommitAck=true;
     Serial.print("[SD] Attendance commit VERIFIED seq="); Serial.println(seq);
     return true;
   }
-
-  // Keep the journal active until the NVS removal itself is verified. If a
-  // later loop finds the exact row at EOF, finalizeAttendanceCommit() will
-  // return here without double-counting because attendanceStateAppliedSeq
-  // already contains the runtime sequence.
   Serial.println("[SD] ERROR: attendance journal cleanup failed; transaction retained.");
   return false;
 }
@@ -352,14 +307,12 @@ static void removeRamLogSeq(uint32_t seq) {
   if(seq==0) return;
   if(!lockState(150)) return;
   if(logCount<=0) { unlockState(); return; }
-
   int target=-1;
   for(int i=0;i<logCount;i++) {
     int idx=(logWriteIndex-logCount+i+MAX_LOGS)%MAX_LOGS;
     if(logs[idx].seq==seq) { target=idx; break; }
   }
   if(target<0) { unlockState(); return; }
-
   const int newest=(logWriteIndex-1+MAX_LOGS)%MAX_LOGS;
   int cur=target;
   while(cur!=newest) {
@@ -372,7 +325,6 @@ static void removeRamLogSeq(uint32_t seq) {
   logs[newest].id=-1; logs[newest].seq=0; logs[newest].savedToSd=false;
   logWriteIndex=newest;
   logCount--;
-
   cachedLastEntryJsonForId=-1;
   cachedLastEntryJson="null";
   if(logCount>0) {
@@ -386,10 +338,6 @@ static void removeRamLogSeq(uint32_t seq) {
   unlockState();
 }
 
-
-// =====================================================
-// LOG CREATION
-// =====================================================
 bool addLog(String event, int id, String message) {
   AttendanceLog entry;
   entry.timeText = uptimeText();
@@ -412,9 +360,6 @@ bool addLog(String event, int id, String message) {
     logs[logWriteIndex] = entry;
     logWriteIndex = (logWriteIndex + 1) % MAX_LOGS;
     if (logCount < MAX_LOGS) logCount++; else ramDropped++;
-
-    // Keep the last-entry cache under the same mutex as the source log.
-    // Async HTTP handlers only ever copy it while holding this mutex.
     if (id >= 1 && id <= MAX_FINGERPRINTS) {
       cachedLastEntryJsonForId=id;
       cachedLastEntryJson="{\"id\":"+String(id)+",\"name\":\""+jsonEscape(entry.name)+"\",\"collegeId\":\""+jsonEscape(entry.collegeId)+"\",\"department\":\""+jsonEscape(entry.department)+"\",\"message\":\"Last check in\"}";
@@ -428,18 +373,6 @@ bool addLog(String event, int id, String message) {
   if(!stateAdded || seq==0) return false;
   bootSnapshotDirty = true;
 
-  // ---- STORAGE ROUTING (attendance.csv vs system.log) --------------
-  // event_type is only ever non-empty for the two real attendance
-  // actions (see attendanceEventTypeOf()). Everything else -- INFO,
-  // ERROR, WARNING, ENROLL, ENROLL REQUEST, ENROLLED, CANCEL, DELETE,
-  // DUPLICATE, MATCH, NOT FOUND, SYSTEM_READY, Wi-Fi/SD diagnostics,
-  // etc. -- goes to /system.log. A valid RTC/NTP date is required for
-  // an attendance row; if it's missing (entry.timeText is the
-  // "UPTIME HH:MM:SS" fallback) the event is demoted to system.log
-  // instead of ever being written with an invalid date, matching the
-  // time-validation rule in section 4. This is only a safety net --
-  // scanFingerprint() already refuses to create an attendance record
-  // at all when time is invalid, before addLog() is ever called.
   String rowDate, rowTime;
   bool haveValidTime = splitDateTimeText(entry.timeText, rowDate, rowTime);
   String eventType = haveValidTime ? attendanceEventTypeOf(event) : String("");
@@ -463,15 +396,25 @@ bool addLog(String event, int id, String message) {
     AttendanceEvent qEvt; qEvt.seq=seq;
     strncpy(qEvt.row,row.c_str(),sizeof(qEvt.row)-1);
     qEvt.row[sizeof(qEvt.row)-1]='\0';
-    // The journal is authoritative. Queue is a fast signal; if it cannot be
-    // queued, sdTask will discover the journal and recover it directly.
     if(xQueueSend(attendanceQueue,&qEvt,0)!=pdTRUE) {
       Serial.println("[SD] attendance queue full; journal retained for sdTask recovery.");
     }
 
-    // Do not report success or alter presence state until the verified SD
-    // commit has completed.
-    return waitForAttendanceCommit(seq,SD_COMMIT_WAIT_MS);
+    bool committed = waitForAttendanceCommit(seq, SD_COMMIT_WAIT_MS);
+
+    // Cloud sync: enqueue after local SD commit so we never queue an event
+    // that failed local persistence. The outbox is in-memory and non-blocking.
+    // Retries with exponential backoff happen in CloudSync.loop().
+    if (committed && CloudSync.isEnabled()) {
+      CloudSync.enqueueAttendance(
+        rowDate.c_str(), rowTime.c_str(), id,
+        entry.name.c_str(), entry.collegeId.c_str(),
+        entry.role.c_str(), entry.department.c_str(),
+        eventType.c_str(), status.c_str()
+      );
+    }
+
+    return committed;
   } else {
     String level="INFO";
     String eUp=event; eUp.toUpperCase();
@@ -482,8 +425,6 @@ bool addLog(String event, int id, String message) {
     SystemLogEvent qEvt; qEvt.seq=seq;
     strncpy(qEvt.row,row.c_str(),sizeof(qEvt.row)-1); qEvt.row[sizeof(qEvt.row)-1]='\0';
     if(xQueueSend(systemLogQueue,&qEvt,pdMS_TO_TICKS(5))!=pdTRUE) {
-      // Keep a small protected overflow buffer so a burst of diagnostics
-      // cannot silently disappear just because the SD writer queue is full.
       bool retained = false;
       if(lockState(50)) {
         if(systemLogFallbackCount < 4) {

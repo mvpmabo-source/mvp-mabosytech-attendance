@@ -396,6 +396,13 @@ void sdTaskFunc(void *pv) {
       continue;
     }
 
+    // Shared ownership gate: cloud outbox access must not overlap any
+    // filesystem work performed by this single-owner SD task.
+    if (!lockCloudSd(1000)) {
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+
     if (!attendanceBootReady && sdAvailable) {
       const unsigned long nowBoot = millis();
       if ((long)(nowBoot - nextBootPreparationRetryMs) >= 0) {
@@ -449,6 +456,7 @@ void sdTaskFunc(void *pv) {
     // true. There is no second background scan here, so the browser cannot see
     // a moving target while the boot snapshot is being assembled.
 
+    unlockCloudSd();
     vTaskDelay(pdMS_TO_TICKS(5));
     unsigned long now=millis();
     if(now-lastStackReport>=10000){lastStackReport=now;Serial.printf("[STACK] sdTask HWM: %u bytes free\n",(unsigned)uxTaskGetStackHighWaterMark(NULL));}
@@ -1204,7 +1212,8 @@ void scanSdHistoryOnBootTask() {
         if (checkIn) { entries++; lastEntry=id; }
         else { exits++; }
 
-        if (todayDate.length()==10 && fields[0] == todayDate) {
+        // Cloud-only firmware keeps durable history on SD/cloud; rebuilding per-row String objects here fragments internal RAM needed by TLS. Counters above are still computed from every valid SD row.
+        if (!CLOUD_ONLY_MODE && todayDate.length()==10 && fields[0] == todayDate) {
           const String statusDisplay = attendanceStatusDisplayOf(fields[8]);
           const String eventText = (checkIn ? "CHECK IN - " : "CHECK OUT - ") + statusDisplay;
           const String combinedTime = fields[0] + " " + fields[1];

@@ -1,6 +1,23 @@
 #include "app.h"
 #include <esp_system.h>
 #include "mbedtls/sha256.h"
+#include <ArduinoJson.h>
+
+static void handleCloudCommand(const char* commandId, const char* command, const char* payload);
+static void handleCloudSettings(const char* settingsJson);
+static char activeCloudEnrollCommandId[40] = "";
+static uint16_t pendingCloudEnrollTargetId = 0;
+static constexpr uint8_t CLOUD_FP_SLOT_EMPTY_CODE = 0x0C;
+
+// Fail closed: a dashboard-selected fingerprint slot may only be used when the
+// sensor positively reports that the slot is empty. UART errors are not "empty".
+static uint8_t cloudFingerprintSlotStatus(uint16_t id) {
+  if (id < 1 || id > MAX_FINGERPRINTS) return 0xFF;
+  if (!lockFinger(500)) return 0xFF;
+  const uint8_t status = finger.loadModel(id);
+  unlockFinger();
+  return status;
+}
 
 void setup() {
   Serial.begin(115200);
@@ -39,20 +56,18 @@ void setup() {
   ramLogSnapshotMutex = xSemaphoreCreateMutex();
   rtcMutex            = xSemaphoreCreateMutex();
   authSessionMutex    = xSemaphoreCreateMutex();
+  cloudSdMutex        = xSemaphoreCreateMutex();
   attendanceQueue  = xQueueCreate(16, sizeof(AttendanceEvent));
   sdRequestQueue   = xQueueCreate(2,  sizeof(SdBulkRequest));
   // Reply buffering gives the async HTTP bridge room to absorb SD output
   // without making the SD task wait for every network write.
   lessonAppendQueue= xQueueCreate(8,  sizeof(LessonAppend));
   systemLogQueue   = xQueueCreate(32, sizeof(SystemLogEvent));
-  // The HTTP task only submits the newest browser epoch here; all RTC/I2C
-  // and Preferences writes are performed by loop() via serviceBrowserTimeSync().
-  browserTimeSyncQueue = xQueueCreate(1, sizeof(uint32_t));
+  // The legacy browser-time-sync queue is unused in cloud-only mode.
 
   prefs.begin("fps_db", false);
   loadAttendanceJournal();
   loadPresenceState();
-  loadAuthAccount();
   // OTA authentication uses its dedicated OTA_PASSWORD. It is independent
   // of the dashboard account's salted password record.
   setupOTA();
@@ -77,30 +92,18 @@ void setup() {
   ensureLessonsCsv();
   ensureSystemLog();
 
-  // Use the exact AsyncWebServer construction pattern proven by the
-  // standalone Async HTTP isolation test: one global AsyncWebServer object,
-  // no custom AsyncTCP stack/core overrides, and server.begin() after AP +
-  // setup-time SD mount are ready.
-  Serial.printf("[WIFI] before HTTP routes: connected=%s ip=%s freeHeap=%u\n",
-                wifiDashboardReady() ? "YES" : "NO",
-                wifiDashboardReady() ? WiFi.localIP().toString().c_str() : "0.0.0.0",
-                (unsigned)ESP.getFreeHeap());
-
+  // CLOUD-ONLY MODE:
+  // Do not start the legacy local HTTP dashboard/API. Its HTTPD task, route
+  // handlers, SD stream queues and JSON bootstrap caches consume fragmented
+  // heap needed by mbedTLS certificate parsing and HTTPS cloud sync.
+  // Enrollment, restart and time sync are handled by authenticated cloud commands.
   dashboardBootReady = false;
   attendanceBootReady = false;
-  initFastStatusCache();
-  initBootSnapshotCache();
-  initSdHttpBridge();
-  setupDashboardRoutes();
-  xTaskCreatePinnedToCore(sdTaskFunc,  "sdTask",  6144, nullptr, 1, &sdTaskHandle,  1);
-  Serial.printf("[WIFI] after full network setup: connected=%s ip=%s freeHeap=%u\n",
-                wifiDashboardReady() ? "YES" : "NO",
-                wifiDashboardReady() ? WiFi.localIP().toString().c_str() : "0.0.0.0",
-                (unsigned)ESP.getFreeHeap());
+  Serial.printf("[MEM] Cloud-only mode: local dashboard disabled; freeHeap=%u maxAlloc=%u\n",
+                (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+  xTaskCreatePinnedToCore(sdTaskFunc, "sdTask", 6144, nullptr, 1, &sdTaskHandle, 1);
 
-  // Migration, boot-history loading, and all subsequent filesystem I/O are
-  // owned by sdTask. The initial mount was already completed above, before
-  // HTTP allocations, to preserve the legacy card-detection behavior.
+  // SD history/migration and subsequent filesystem I/O remain owned by sdTask.
 
   fingerSerial.begin(57600, SERIAL_8N2, FINGER_RX, FINGER_TX);
   finger.begin(57600);
@@ -148,6 +151,14 @@ void setup() {
 
   if (fingerprintSensorOk) fpSetLed(true);
 
+  CloudSync.begin(CLOUD_DEVICE_ID, CLOUD_API_KEY);
+  CloudSync.onCommand(handleCloudCommand);
+  CloudSync.onSettings(handleCloudSettings);
+  if (CloudSync.isEnabled())
+    addLog("INFO", -1, "Cloud sync enabled");
+  else
+    Serial.println("[CLOUD] Cloud sync disabled — set CLOUD_DEVICE_ID and CLOUD_API_KEY in secrets_local.h");
+
   addLog("INFO", -1, "System ready");
   oledScanScreen();
 
@@ -155,7 +166,7 @@ void setup() {
                 wifiDashboardReady() ? "YES" : "NO",
                 wifiDashboardReady() ? WiFi.localIP().toString().c_str() : "0.0.0.0",
                 (unsigned)ESP.getFreeHeap());
-  Serial.println("[BOOT] AsyncWebServer active; SD task running.");
+  Serial.println("[BOOT] Cloud-only mode active; local HTTP dashboard disabled; SD task running.");
 }
 
 // =====================================================
@@ -175,14 +186,11 @@ void loop() {
 
   // Keep Wire/DS3231 and Preferences out of AsyncTCP callbacks. The network
   // callback only enqueues the browser epoch; loop() owns the actual write.
-  serviceBrowserTimeSync();
   serviceDeviceSetupPersistence();
-  serviceFastStatusCache();
 
   serviceLedBuzzerTimers();
   serviceWeekendAttendanceFeedback();
   serviceOledKeepAlive();
-  serviceBootSnapshotRefresh();
   bool applyFingerprintSecurity = false;
   if (lockState(20)) {
     applyFingerprintSecurity = fingerprintSecurityDirty && fingerprintSensorOk && !isEnrolling;
@@ -200,6 +208,16 @@ void loop() {
     servicePendingRestart();
     delay(1);
     return;
+  }
+
+  // One-shot: recover pending cloud outbox events from SD after boot is ready.
+  static bool cloudOutboxRecovered = false;
+  if (!cloudOutboxRecovered) {
+    cloudOutboxRecovered = true;
+    if (CloudSync.isEnabled()) {
+      CloudSync.recoverOutboxFromSD();
+      Serial.printf("[CLOUD] Outbox recovery done. Pending: %d\n", CloudSync.pendingCount());
+    }
   }
 
   // -----------------------------------------------------------------
@@ -220,20 +238,56 @@ void loop() {
   if (startRequested) {
     String eName, eCollege, eRole, eDept, eNote;
     uint16_t targetId;
+    uint16_t requestedCloudTargetId = 0;
     if (lockState()) {
       dashboardEnrollRequest = false;
       isEnrolling = true; cancelEnroll = false; duplicateFound = false;
       eName=pendingName; eCollege=pendingCollegeId;
       eRole=pendingRole; eDept=pendingDepartment; eNote=pendingNote;
-      targetId = nextEnrollID;
+      requestedCloudTargetId = pendingCloudEnrollTargetId;
+      pendingCloudEnrollTargetId = 0;
+      targetId = requestedCloudTargetId > 0 ? requestedCloudTargetId : nextEnrollID;
       unlockState();
     } else targetId = 0;
+
+    // If the dashboard supplied a specific slot, verify it is definitely empty
+    // before asking the sensor to store there. This prevents accidental overwrite.
+    const uint8_t requestedSlotStatus =
+      (requestedCloudTargetId > 0 && targetId > 0)
+        ? cloudFingerprintSlotStatus(targetId)
+        : CLOUD_FP_SLOT_EMPTY_CODE;
 
     if (targetId == 0) {
       addLog("ERROR", -1, "Fingerprint database full (200/200). Delete a record to free a slot.");
       oledErrorAnimation("DATABASE FULL", "Delete a record");
       smartDelay(1500);
       if (lockState()) { pendingName=pendingCollegeId=pendingRole=pendingDepartment=pendingNote=""; isEnrolling=false; unlockState(); }
+      if (activeCloudEnrollCommandId[0]) {
+        CloudSync.completeCommand(activeCloudEnrollCommandId, false, "{\"ok\":false,\"error\":\"fingerprint_database_full\"}");
+        activeCloudEnrollCommandId[0] = '\0';
+        CloudSync.flushCommandAcks();
+      }
+      oledScanScreen();
+    } else if (requestedCloudTargetId > 0 && requestedSlotStatus != CLOUD_FP_SLOT_EMPTY_CODE) {
+      const bool occupied = requestedSlotStatus == FINGERPRINT_OK;
+      addLog("ERROR", requestedCloudTargetId,
+             occupied ? "Requested fingerprint slot is already occupied" :
+                        "Could not verify requested fingerprint slot");
+      oledErrorAnimation(occupied ? "SLOT OCCUPIED" : "SLOT CHECK FAILED",
+                         occupied ? "Choose free FP ID" : "Try command again");
+      smartDelay(1200);
+      if (lockState()) {
+        pendingName=pendingCollegeId=pendingRole=pendingDepartment=pendingNote="";
+        isEnrolling=false; cancelEnroll=false; duplicateFound=false;
+        unlockState();
+      }
+      if (activeCloudEnrollCommandId[0]) {
+        const char* slotError = occupied ? "fingerprint_slot_occupied" : "fingerprint_slot_check_failed";
+        String result = String("{\"ok\":false,\"error\":\"") + slotError + "\"}";
+        CloudSync.completeCommand(activeCloudEnrollCommandId, false, result.c_str());
+        activeCloudEnrollCommandId[0] = '\0';
+        CloudSync.flushCommandAcks();
+      }
       oledScanScreen();
     } else {
       addLog("ENROLL", -1, eName.length()>0 ? ("Enrollment started for " + eName) : "Enrollment started");
@@ -242,6 +296,7 @@ void loop() {
       bool wasCancelled=false, wasDuplicate=false;
       if (lockState()) { wasCancelled=cancelEnroll; wasDuplicate=duplicateFound; unlockState(); }
 
+      bool cloudEnrollSucceeded = false;
       if (wasCancelled) {
         addLog("CANCEL", -1, "Enrollment cancelled");
         oledBig("CANCELLED", "Back to scan"); smartDelay(1000);
@@ -261,7 +316,8 @@ void loop() {
         Serial.print("Enrollment successful. ID: "); Serial.println(targetId);
         smartDelay(900);
         appendRegisteredEntry(targetId, p);
-        uint16_t nextFree = findNextFreeFrom(targetId + 1);
+        uint16_t nextFree = findNextFreeFrom(
+          requestedCloudTargetId > 0 ? 1 : (uint16_t)(targetId + 1));
         if (lockState()) {
           if (nextFree == 0xFFFF) {
             // A transport failure is never interpreted as an empty slot.
@@ -278,6 +334,7 @@ void loop() {
           addLog("ERROR", -1, "Fingerprint slot scan failed after enrollment; no slot will be reused until the sensor is rescanned.");
         }
         refreshTemplateCountCache();
+        cloudEnrollSucceeded = true;
       } else {
         addLog("ERROR", -1, "Enrollment failed");
         oledErrorAnimation("Not saved", "Try again");
@@ -287,6 +344,14 @@ void loop() {
         pendingName=pendingCollegeId=pendingRole=pendingDepartment=pendingNote="";
         isEnrolling=false; cancelEnroll=false; duplicateFound=false;
         unlockState();
+      }
+      if (activeCloudEnrollCommandId[0]) {
+        String enrollResult = cloudEnrollSucceeded
+          ? (String("{\"ok\":true,\"message\":\"fingerprint_enrolled\",\"fingerprint_id\":") + String(targetId) + "}")
+          : String("{\"ok\":false,\"error\":\"enrollment_failed_or_cancelled\"}");
+        CloudSync.completeCommand(activeCloudEnrollCommandId, cloudEnrollSucceeded, enrollResult.c_str());
+        activeCloudEnrollCommandId[0] = '\0';
+        CloudSync.flushCommandAcks();
       }
       fpWake();   // restart the idle timer after enrollment
       oledScanScreen();
@@ -313,6 +378,42 @@ void loop() {
       serviceScanResultPhase();
       fpNoteActivity();   // showing a result counts as activity
     }
+  }
+
+  // ---- Cloud sync (non-blocking) ----
+  CloudSync.loop();
+
+  // Poll cloud commands and refresh device presence every ~15s. This keeps
+  // dashboard actions responsive without issuing a heartbeat on every loop.
+  static unsigned long lastCloudHb = 0;
+  if (CloudSync.isEnabled() && millis() - lastCloudHb >= 15000UL) {
+    lastCloudHb = millis();
+    struct tm tm;
+    bool haveTime = getCurrentDateTime(tm);
+    char dateBuf[12] = "", timeBuf[10] = "";
+    if (haveTime) {
+      snprintf(dateBuf, sizeof(dateBuf), "%04d-%02d-%02d", tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday);
+      snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+    }
+    CloudSync.sendHeartbeat(
+      FIRMWARE_VERSION,
+      wifiDashboardReady(),
+      wifiDashboardReady() ? WiFi.localIP().toString().c_str() : "",
+      WiFi.RSSI(),
+      (int)ESP.getFreeHeap(),
+      (bool)sdAvailable,
+      (bool)rtcAvailable,
+      (bool)rtcTimeValid,
+      (int)cachedTemplateCount,
+      MAX_FINGERPRINTS,
+      entryCount, exitCount,
+      CloudSync.pendingCount(),
+      minutesToHHMM(cfgCheckinMinutes).c_str(),
+      minutesToHHMM(cfgCheckoutMinutes).c_str(),
+      cfgDeviceName.c_str(),
+      isEnrolling,
+      fingerprintSensorOk
+    );
   }
 
   servicePendingRestart();
@@ -414,4 +515,243 @@ void servicePendingRestart() {
   if (!pendingRestart || (long)(millis()-pendingRestartAtMs) < 0) return;
   pendingRestart=false;
   ESP.restart();
+}
+
+
+static bool normalizeCloudTimezone(String requested, String& posixTimezone) {
+  requested.trim();
+  if (requested.length() == 0 || requested.length() > 64) return false;
+
+  // The ESP32 time API uses POSIX TZ strings rather than the full IANA database.
+  // Map the project's likely Rwanda/East-Africa settings explicitly.
+  if (requested.equalsIgnoreCase("Africa/Kigali") ||
+      requested.equalsIgnoreCase("Africa/Maputo") ||
+      requested.equalsIgnoreCase("Africa/Harare") ||
+      requested.equalsIgnoreCase("Africa/Lusaka") ||
+      requested.equalsIgnoreCase("Africa/Blantyre") ||
+      requested.equalsIgnoreCase("Africa/Bujumbura")) {
+    posixTimezone = "CAT-2";
+    return true;
+  }
+  if (requested.equalsIgnoreCase("Africa/Nairobi") ||
+      requested.equalsIgnoreCase("Africa/Kampala") ||
+      requested.equalsIgnoreCase("Africa/Dar_es_Salaam")) {
+    posixTimezone = "EAT-3";
+    return true;
+  }
+  if (requested.equalsIgnoreCase("UTC") || requested.equalsIgnoreCase("Etc/UTC")) {
+    posixTimezone = "UTC0";
+    return true;
+  }
+
+  // Accept explicit POSIX TZ strings (e.g. CAT-2 or CET-1CEST,M3.5.0/2,M10.5.0/3).
+  // Reject unknown IANA-style paths rather than silently applying the wrong offset.
+  if (requested.indexOf('/') >= 0 && requested.indexOf(',') < 0) return false;
+  bool hasLetter = false;
+  bool hasDigit = false;
+  for (size_t i = 0; i < requested.length(); ++i) {
+    const char ch = requested.charAt(i);
+    if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')) hasLetter = true;
+    else if (ch >= '0' && ch <= '9') hasDigit = true;
+    else if (ch != '+' && ch != '-' && ch != ',' && ch != '/' && ch != '.' && ch != ':') return false;
+  }
+  if (!hasLetter || !hasDigit) return false;
+  posixTimezone = requested;
+  return true;
+}
+
+static bool applyCloudSettingsDocument(JsonDocument& data, bool& changed, String& error) {
+  changed = false;
+  error = "";
+
+  const char* checkin = data["checkin_time"] | (data["check_in_time"] | "");
+  const char* checkout = data["checkout_time"] | (data["check_out_time"] | "");
+  String deviceName = data["device_name"] | (data["display_name"] | "");
+  deviceName.trim();
+  const char* timezoneRaw = data["timezone"] | (data["time_zone"] | "");
+
+  const bool hasCheckin = checkin && checkin[0];
+  const bool hasCheckout = checkout && checkout[0];
+  const bool hasName = deviceName.length() > 0;
+  const bool hasTimezone = timezoneRaw && timezoneRaw[0];
+
+  if (!hasCheckin && !hasCheckout && !hasName && !hasTimezone) {
+    error = "no_supported_settings_in_payload";
+    return false;
+  }
+
+  int checkinMinutes = -1;
+  int checkoutMinutes = -1;
+  if (hasCheckin) {
+    checkinMinutes = hhmmToMinutes(String(checkin));
+    if (checkinMinutes < 0 || checkinMinutes >= 1440) {
+      error = "invalid_checkin_time";
+      return false;
+    }
+  }
+  if (hasCheckout) {
+    checkoutMinutes = hhmmToMinutes(String(checkout));
+    if (checkoutMinutes < 0 || checkoutMinutes >= 1440) {
+      error = "invalid_checkout_time";
+      return false;
+    }
+  }
+  if (hasName && deviceName.length() > 48) {
+    error = "device_name_too_long";
+    return false;
+  }
+
+  String posixTimezone;
+  if (hasTimezone && !normalizeCloudTimezone(String(timezoneRaw), posixTimezone)) {
+    error = "unsupported_timezone_format";
+    return false;
+  }
+
+  if (!lockState(100)) {
+    error = "state_lock_unavailable";
+    return false;
+  }
+  if (hasCheckin && cfgCheckinMinutes != checkinMinutes) {
+    cfgCheckinMinutes = checkinMinutes;
+    changed = true;
+  }
+  if (hasCheckout && cfgCheckoutMinutes != checkoutMinutes) {
+    cfgCheckoutMinutes = checkoutMinutes;
+    changed = true;
+  }
+  if (hasName && cfgDeviceName != deviceName) {
+    cfgDeviceName = deviceName;
+    changed = true;
+  }
+  if (hasTimezone && cfgTimezone != posixTimezone) {
+    cfgTimezone = posixTimezone;
+    changed = true;
+  }
+  unlockState();
+
+  if (changed) deviceSetupPersistPending = true;
+  return true;
+}
+
+static void handleCloudSettings(const char* settingsJson) {
+  if (!settingsJson || !settingsJson[0]) return;
+  JsonDocument settings;
+  DeserializationError err = deserializeJson(settings, settingsJson);
+  if (err) {
+    Serial.printf("[CLOUD] Ignoring malformed heartbeat settings: %s\n", err.c_str());
+    return;
+  }
+
+  bool changed = false;
+  String error;
+  if (!applyCloudSettingsDocument(settings, changed, error)) {
+    Serial.printf("[CLOUD] Heartbeat settings not applied: %s\n", error.c_str());
+    return;
+  }
+  Serial.printf("[CLOUD] Heartbeat settings processed; changed=%s\n", changed ? "yes" : "no");
+}
+
+static void handleCloudCommand(const char* commandId, const char* command, const char* payload) {
+  if (!commandId || !command || !command[0]) return;
+  JsonDocument data;
+  if (payload && payload[0]) {
+    DeserializationError err = deserializeJson(data, payload);
+    if (err) {
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"invalid_payload_json\"}");
+      return;
+    }
+  }
+
+  if (!strcmp(command, "sync_time")) {
+    uint32_t epoch = data["epoch"] | (data["unix_epoch"] | (data["timestamp"] | 0UL));
+    bool ok = epoch >= 1704067200UL && syncRTCFromBrowserEpoch(epoch);
+    CloudSync.completeCommand(commandId, ok,
+      ok ? "{\"ok\":true,\"message\":\"rtc_synced\"}" :
+           "{\"ok\":false,\"error\":\"invalid_epoch_or_rtc_sync_failed\"}");
+    CloudSync.flushCommandAcks();
+    return;
+  }
+
+  if (!strcmp(command, "restart")) {
+    CloudSync.completeCommand(commandId, true, "{\"ok\":true,\"message\":\"restart_scheduled\"}");
+    CloudSync.flushCommandAcks();
+    requestRestart(false);
+    return;
+  }
+
+  if (!strcmp(command, "update_settings")) {
+    bool changed = false;
+    String error;
+    const bool ok = applyCloudSettingsDocument(data, changed, error);
+
+    JsonDocument result;
+    result["ok"] = ok;
+    if (ok) result["message"] = changed ? "settings_applied" : "settings_already_current";
+    else result["error"] = error;
+
+    String resultJson;
+    serializeJson(result, resultJson);
+    CloudSync.completeCommand(commandId, ok, resultJson.c_str());
+    CloudSync.flushCommandAcks();
+    return;
+  }
+
+  if (!strcmp(command, "enroll_fingerprint") || !strcmp(command, "enroll")) {
+    if (!fingerprintSensorOk || isEnrolling || dashboardEnrollRequest || activeCloudEnrollCommandId[0]) {
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"sensor_unavailable_or_enrollment_busy\"}");
+      CloudSync.flushCommandAcks(); return;
+    }
+    String name = data["name"] | "";
+    String college = data["college_id"] | "";
+    String role = data["role"] | "Teacher";
+    String department = data["department"] | "";
+    String note = data["note"] | "";
+    const int requestedId = data["fingerprint_id"] | 0;
+    if (requestedId < 0 || requestedId > MAX_FINGERPRINTS) {
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"invalid_fingerprint_id\"}");
+      CloudSync.flushCommandAcks(); return;
+    }
+    if (!name.length()) {
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"teacher_name_required\"}");
+      CloudSync.flushCommandAcks(); return;
+    }
+    if (!lockState()) {
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"state_lock_unavailable\"}");
+      CloudSync.flushCommandAcks(); return;
+    }
+    pendingName = name; pendingCollegeId = college; pendingRole = role;
+    pendingDepartment = department; pendingNote = note;
+    pendingCloudEnrollTargetId = (uint16_t)requestedId; // zero means legacy auto-slot selection
+    dashboardEnrollRequest = true;
+    strncpy(activeCloudEnrollCommandId, commandId, sizeof(activeCloudEnrollCommandId)-1);
+    activeCloudEnrollCommandId[sizeof(activeCloudEnrollCommandId)-1] = '\0';
+    unlockState();
+    Serial.printf("[CLOUD] Enrollment queued for %s\n", name.c_str());
+    return; // acknowledge only after sensor enrollment really finishes
+  }
+
+  if (!strcmp(command, "delete_fingerprint") || !strcmp(command, "delete_fingerprint_template")) {
+    int id = data["fingerprint_id"] | (data["template_id"] | 0);
+    if (id < 1 || id > MAX_FINGERPRINTS || !fingerprintSensorOk || !lockFinger(100)) {
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"invalid_id_sensor_unavailable_or_busy\"}");
+      CloudSync.flushCommandAcks(); return;
+    }
+    uint8_t result = finger.deleteModel(id);
+    unlockFinger();
+    if (result == FINGERPRINT_OK) {
+      deleteProfile((uint16_t)id);
+      clearPresenceState((uint16_t)id);
+      removeRegisteredEntry((uint16_t)id);
+      refreshTemplateCountCache();
+      if (nextEnrollID == 0 || id < nextEnrollID) nextEnrollID = (uint16_t)id;
+      CloudSync.completeCommand(commandId, true, "{\"ok\":true,\"message\":\"fingerprint_deleted\"}");
+    } else {
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"sensor_delete_failed\"}");
+    }
+    CloudSync.flushCommandAcks();
+    return;
+  }
+
+  CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"unsupported_command\"}");
+  CloudSync.flushCommandAcks();
 }
