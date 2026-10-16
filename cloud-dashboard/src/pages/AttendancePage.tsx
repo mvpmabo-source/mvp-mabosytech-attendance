@@ -3,7 +3,52 @@ import { CalendarCheck, Search, ChevronLeft, ChevronRight, Download, Filter, X }
 import { supabase, type AttendanceEvent, STATUS_LABELS, STATUS_COLORS, EVENT_LABELS } from "@/lib/supabase";
 import { Card, LoadingSpinner, EmptyState, ErrorState, Badge } from "@/components/ui";
 
+
 const PAGE_SIZE = 25;
+
+type TeacherProfile = {
+  fingerprint_id: number;
+  name: string | null;
+  college_id: string | null;
+  role: string | null;
+  department: string | null;
+};
+
+function isBlank(value: string | null | undefined): boolean {
+  const text = (value ?? "").trim();
+  return !text || text === "-" || text === "—";
+}
+
+function isGenericName(value: string | null | undefined, fingerprintId: number): boolean {
+  const text = (value ?? "").trim();
+  return isBlank(text) || new RegExp("^ID\\s*" + fingerprintId + "$", "i").test(text);
+}
+
+function enrichVisibleAttendance(events: AttendanceEvent[], profiles: TeacherProfile[]): AttendanceEvent[] {
+  const byFingerprintId = new Map<number, TeacherProfile>();
+  for (const profile of profiles) byFingerprintId.set(Number(profile.fingerprint_id), profile);
+
+  return events.map((event) => {
+    const profile = byFingerprintId.get(Number(event.fingerprint_id));
+    if (!profile) return event;
+
+    return {
+      ...event,
+      name: isGenericName(event.name, event.fingerprint_id) && !isBlank(profile.name)
+        ? profile.name!.trim()
+        : event.name,
+      college_id: isBlank(event.college_id) && !isBlank(profile.college_id)
+        ? profile.college_id!.trim()
+        : event.college_id,
+      role: isBlank(event.role) && !isBlank(profile.role)
+        ? profile.role!.trim()
+        : event.role,
+      department: isBlank(event.department) && !isBlank(profile.department)
+        ? profile.department!.trim()
+        : event.department,
+    };
+  });
+}
 
 export function AttendancePage() {
   const [loading, setLoading] = useState(true);
@@ -31,7 +76,20 @@ export function AttendancePage() {
         if (statusFilter) query = query.eq("status", statusFilter);
         const { data, error: qErr, count } = await query;
         if (qErr) throw new Error(qErr.message);
-        setEvents((data as AttendanceEvent[]) ?? []);
+
+        // Fill missing/generic fields on old attendance rows from the authoritative
+        // teacher directory. This also improves rows created before device profile
+        // metadata was consistently present. If teacher lookup fails, attendance
+        // remains visible with its original values instead of failing the page.
+        const { data: teacherData, error: teacherErr } = await supabase
+          .from("teachers")
+          .select("fingerprint_id, name, college_id, role, department");
+        if (teacherErr) {
+          console.warn("Could not enrich attendance rows from teacher profiles:", teacherErr.message);
+        }
+
+        const profiles = (teacherData as TeacherProfile[] | null) ?? [];
+        setEvents(enrichVisibleAttendance((data as AttendanceEvent[]) ?? [], profiles));
         setTotal(count ?? 0);
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load attendance records");
