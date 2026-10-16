@@ -100,6 +100,85 @@ function validateTimeString(s: string): boolean {
   return /^\d{2}:\d{2}:\d{2}$/.test(s);
 }
 
+// Device-local Preferences can occasionally lack profile metadata even when the
+// authoritative teacher record exists in Supabase. Fill only missing/generic
+// fields; never replace useful metadata supplied by the ESP32.
+function cleanText(value: unknown): string {
+  if (typeof value !== "string") return value == null ? "" : String(value).trim();
+  return value.trim();
+}
+
+function isMissingText(value: unknown): boolean {
+  const text = cleanText(value);
+  return text === "" || text === "-" || text === "—";
+}
+
+function isGenericName(value: unknown, fingerprintId: number): boolean {
+  const text = cleanText(value);
+  return isMissingText(text) || new RegExp("^ID\\s*" + fingerprintId + "$", "i").test(text);
+}
+
+async function enrichAttendanceMetadata(events: AttendancePayload[]): Promise<AttendancePayload[]> {
+  const idsNeedingProfiles = [...new Set(events
+    .filter((event) =>
+      event &&
+      Number.isInteger(event.fingerprint_id) &&
+      event.fingerprint_id >= 1 &&
+      event.fingerprint_id <= 200 &&
+      (isGenericName(event.name, event.fingerprint_id) ||
+        isMissingText(event.college_id) ||
+        isMissingText(event.role) ||
+        isMissingText(event.department))
+    )
+    .map((event) => event.fingerprint_id))];
+
+  if (idsNeedingProfiles.length === 0) return events;
+
+  // Query only the attendance profile columns (not photo/SVG/signature assets).
+  const { data: profiles, error } = await adminClient
+    .from("teachers")
+    .select("fingerprint_id, name, college_id, role, department")
+    .in("fingerprint_id", idsNeedingProfiles);
+
+  // Metadata enrichment is best-effort: it must never prevent an attendance
+  // event from being saved if the profile table is unavailable.
+  if (error) {
+    console.warn("Attendance profile enrichment lookup failed:", error.message);
+    return events;
+  }
+
+  const profileById = new Map<number, {
+    name?: string | null;
+    college_id?: string | null;
+    role?: string | null;
+    department?: string | null;
+  }>();
+  for (const profile of profiles || []) {
+    profileById.set(Number(profile.fingerprint_id), profile);
+  }
+
+  return events.map((event) => {
+    if (!event) return event;
+    const profile = profileById.get(Number(event.fingerprint_id));
+    if (!profile) return event;
+
+    const resolved: AttendancePayload = { ...event };
+    if (isGenericName(event.name, event.fingerprint_id) && !isMissingText(profile.name)) {
+      resolved.name = cleanText(profile.name);
+    }
+    if (isMissingText(event.college_id) && !isMissingText(profile.college_id)) {
+      resolved.college_id = cleanText(profile.college_id);
+    }
+    if (isMissingText(event.role) && !isMissingText(profile.role)) {
+      resolved.role = cleanText(profile.role);
+    }
+    if (isMissingText(event.department) && !isMissingText(profile.department)) {
+      resolved.department = cleanText(profile.department);
+    }
+    return resolved;
+  });
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
@@ -149,21 +228,23 @@ Deno.serve(async (req: Request) => {
         return jsonError(400, "Invalid status value");
       }
 
+      const [resolvedEvent] = await enrichAttendanceMetadata([event]);
+
       const { error: insertError } = await adminClient
         .from("attendance_events")
         .upsert(
           {
-            event_uid: event.event_uid,
+            event_uid: resolvedEvent.event_uid,
             device_id: deviceId,
-            event_date: event.date,
-            event_time: event.time,
-            fingerprint_id: event.fingerprint_id,
-            name: event.name || "",
-            college_id: event.college_id || "",
-            role: event.role || "",
-            department: event.department || "",
-            event_type: event.event_type,
-            status: event.status,
+            event_date: resolvedEvent.date,
+            event_time: resolvedEvent.time,
+            fingerprint_id: resolvedEvent.fingerprint_id,
+            name: resolvedEvent.name || "",
+            college_id: resolvedEvent.college_id || "",
+            role: resolvedEvent.role || "",
+            department: resolvedEvent.department || "",
+            event_type: resolvedEvent.event_type,
+            status: resolvedEvent.status,
             synced_at: new Date().toISOString(),
           },
           { onConflict: "event_uid", ignoreDuplicates: true }
@@ -315,8 +396,9 @@ Deno.serve(async (req: Request) => {
         return jsonError(400, "Batch too large (max 50 events)");
       }
 
+      const resolvedEvents = await enrichAttendanceMetadata(events);
       const rows: Record<string, unknown>[] = [];
-      for (const event of events) {
+      for (const event of resolvedEvents) {
         if (!event.event_uid || event.event_uid.length < 4) continue;
         if (!validateDateString(event.date) || !validateTimeString(event.time)) continue;
         if (!event.fingerprint_id || event.fingerprint_id < 1 || event.fingerprint_id > 200) continue;
