@@ -100,6 +100,47 @@ function validateTimeString(s: string): boolean {
   return /^\d{2}:\d{2}:\d{2}$/.test(s);
 }
 
+
+function isGenericName(name: string): boolean {
+  return !name || name.trim() === "" || /^ID\\s*\\d+$/i.test(name.trim());
+}
+
+// Best-effort enrichment by exact fingerprint ID. Never overwrite populated
+// profile fields and never reject a valid attendance event if lookup fails.
+async function enrichFromTeachers(
+  fingerprintId: number,
+  name: string,
+  collegeId: string,
+  role: string,
+  department: string
+): Promise<{ name: string; college_id: string; role: string; department: string }> {
+  const needName = isGenericName(name);
+  const needCollege = !collegeId || !collegeId.trim() || ["-", "—"].includes(collegeId.trim());
+  const needRole = !role || !role.trim() || ["-", "—"].includes(role.trim());
+  const needDepartment = !department || !department.trim() || ["-", "—"].includes(department.trim());
+
+  if (!needName && !needCollege && !needRole && !needDepartment) {
+    return { name, college_id: collegeId, role, department };
+  }
+
+  try {
+    const { data, error } = await adminClient
+      .from("teachers")
+      .select("name, college_id, role, department")
+      .eq("fingerprint_id", fingerprintId)
+      .maybeSingle();
+    if (error || !data) return { name, college_id: collegeId, role, department };
+    return {
+      name: needName ? (String(data.name || "").trim() || name) : name,
+      college_id: needCollege ? (String(data.college_id || "").trim() || collegeId) : collegeId,
+      role: needRole ? (String(data.role || "").trim() || role) : role,
+      department: needDepartment ? (String(data.department || "").trim() || department) : department,
+    };
+  } catch {
+    return { name, college_id: collegeId, role, department };
+  }
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
@@ -149,6 +190,14 @@ Deno.serve(async (req: Request) => {
         return jsonError(400, "Invalid status value");
       }
 
+      const enriched = await enrichFromTeachers(
+        event.fingerprint_id,
+        event.name || "",
+        event.college_id || "",
+        event.role || "",
+        event.department || ""
+      );
+
       const { error: insertError } = await adminClient
         .from("attendance_events")
         .upsert(
@@ -158,10 +207,10 @@ Deno.serve(async (req: Request) => {
             event_date: event.date,
             event_time: event.time,
             fingerprint_id: event.fingerprint_id,
-            name: event.name || "",
-            college_id: event.college_id || "",
-            role: event.role || "",
-            department: event.department || "",
+            name: enriched.name,
+            college_id: enriched.college_id,
+            role: enriched.role,
+            department: enriched.department,
             event_type: event.event_type,
             status: event.status,
             synced_at: new Date().toISOString(),
@@ -323,16 +372,24 @@ Deno.serve(async (req: Request) => {
         if (!VALID_EVENT_TYPES.has(event.event_type)) continue;
         if (!VALID_STATUSES.has(event.status)) continue;
 
+        const enriched = await enrichFromTeachers(
+          event.fingerprint_id,
+          event.name || "",
+          event.college_id || "",
+          event.role || "",
+          event.department || ""
+        );
+
         rows.push({
           event_uid: event.event_uid,
           device_id: deviceId,
           event_date: event.date,
           event_time: event.time,
           fingerprint_id: event.fingerprint_id,
-          name: event.name || "",
-          college_id: event.college_id || "",
-          role: event.role || "",
-          department: event.department || "",
+          name: enriched.name,
+          college_id: enriched.college_id,
+          role: enriched.role,
+          department: enriched.department,
           event_type: event.event_type,
           status: event.status,
           synced_at: new Date().toISOString(),
