@@ -151,7 +151,7 @@ void setupTime() {
 // the full DS3231 + system clock update before reporting command success.
 bool syncRTCFromCloudEpoch(uint32_t utcEpoch) {
   if (utcEpoch < 1704067200UL || utcEpoch > 4102444800UL) {
-    Serial.printf("[RTC] Cloud sync rejected invalid UTC epoch: %lu\\n", (unsigned long)utcEpoch);
+    Serial.printf("[RTC] Cloud sync rejected invalid UTC epoch: %lu\n", (unsigned long)utcEpoch);
     return false;
   }
 
@@ -206,7 +206,7 @@ bool syncRTCFromCloudEpoch(uint32_t utcEpoch) {
   persistLastKnownUtc(utcEpoch);
   bootSnapshotDirty = true;
 
-  Serial.printf("[RTC] Cloud sync verified Rwanda time: %04d-%02d-%02d %02d:%02d:%02d\\n",
+  Serial.printf("[RTC] Cloud sync verified Rwanda time: %04d-%02d-%02d %02d:%02d:%02d\n",
                 localTime.tm_year + 1900,
                 localTime.tm_mon + 1,
                 localTime.tm_mday,
@@ -376,7 +376,7 @@ String currentDateOnlyText() {
 String jsonEscape(String s) {
   s.replace("\\", "\\\\");
   s.replace("\"", "\\\"");
-  s.replace("\n", "\\n");
+  s.replace("\n", "\n");
   s.replace("\r", "");
   s.replace("</", "<\\/");
   return s;
