@@ -68,7 +68,7 @@ static String attendanceStatusRwLabel(const String &event) {
   // internal event and translate the user-visible status here.
   if (e.indexOf("CHECK OUT") >= 0) {
     if (e.indexOf("LEFT EARLY") >= 0) return "Utashe kare";
-    if (e.indexOf("OVERTIME") >= 0) return "Utashe nyuma y' igihe";
+    if (e.indexOf("OVERTIME") >= 0) return "GOOD BYE!!!!!";
     if (e.indexOf("ON TIME") >= 0) return "Utahiye k' ugihe";
     return "Wavuye";
   }
@@ -80,7 +80,7 @@ static String attendanceStatusRwLabel(const String &event) {
     return "Kwinjiye";
   }
 
-  if (e.indexOf("TIME UNKNOWN") >= 0) return "Igihe ntikizwi";
+  if (e.indexOf("TIME UNKNOWN") >= 0) return "Mwihangane igihe ntikibonetse";
   return "";
 }
 
