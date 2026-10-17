@@ -9,6 +9,42 @@ static char activeCloudEnrollCommandId[40] = "";
 static uint16_t pendingCloudEnrollTargetId = 0;
 static constexpr uint8_t CLOUD_FP_SLOT_EMPTY_CODE = 0x0C;
 
+static portMUX_TYPE cloudAckSentMux = portMUX_INITIALIZER_UNLOCKED;
+static char cloudAckSentCommandId[40] = "";
+static char cloudRestartCommandId[40] = "";
+static bool cloudRestartAfterAck = false;
+static unsigned long cloudRestartFallbackAtMs = 0;
+
+static void handleCloudCommandAckSent(const char* commandId) {
+  if (!commandId || !commandId[0]) return;
+  portENTER_CRITICAL(&cloudAckSentMux);
+  strncpy(cloudAckSentCommandId, commandId, sizeof(cloudAckSentCommandId)-1);
+  cloudAckSentCommandId[sizeof(cloudAckSentCommandId)-1] = '\0';
+  portEXIT_CRITICAL(&cloudAckSentMux);
+}
+
+static void serviceCloudRestartAfterAck() {
+  char acknowledgedId[sizeof(cloudAckSentCommandId)] = "";
+  portENTER_CRITICAL(&cloudAckSentMux);
+  strncpy(acknowledgedId, cloudAckSentCommandId, sizeof(acknowledgedId)-1);
+  cloudAckSentCommandId[0] = '\0';
+  portEXIT_CRITICAL(&cloudAckSentMux);
+  if (cloudRestartAfterAck && acknowledgedId[0] &&
+      strcmp(acknowledgedId, cloudRestartCommandId) == 0) {
+    cloudRestartAfterAck = false;
+    cloudRestartCommandId[0] = '\0';
+    Serial.println("[CLOUD] Restart ACK confirmed; scheduling device restart.");
+    requestRestart(false);
+    return;
+  }
+  if (cloudRestartAfterAck && (long)(millis() - cloudRestartFallbackAtMs) >= 0) {
+    cloudRestartAfterAck = false;
+    cloudRestartCommandId[0] = '\0';
+    Serial.println("[CLOUD] Restart ACK did not confirm before timeout; proceeding with bounded restart fallback.");
+    requestRestart(false);
+  }
+}
+
 // Fail closed: a dashboard-selected fingerprint slot may only be used when the
 // sensor positively reports that the slot is empty. UART errors are not "empty".
 static uint8_t cloudFingerprintSlotStatus(uint16_t id) {
@@ -154,6 +190,7 @@ void setup() {
   CloudSync.begin(CLOUD_DEVICE_ID, CLOUD_API_KEY);
   CloudSync.onCommand(handleCloudCommand);
   CloudSync.onSettings(handleCloudSettings);
+  CloudSync.onCommandAckSent(handleCloudCommandAckSent);
   if (CloudSync.isEnabled())
     addLog("INFO", -1, "Cloud sync enabled");
   else
@@ -216,7 +253,7 @@ void loop() {
     cloudOutboxRecovered = true;
     if (CloudSync.isEnabled()) {
       CloudSync.recoverOutboxFromSD();
-      Serial.printf("[CLOUD] Outbox recovery done. Pending: %d\n", CloudSync.pendingCount());
+      Serial.printf("[CLOUD] Outbox recovery requested asynchronously. Pending: %d\n", CloudSync.pendingCount());
     }
   }
 
@@ -380,11 +417,10 @@ void loop() {
     }
   }
 
-  // ---- Cloud sync (non-blocking) ----
+  // CloudSync.loop dispatches callbacks only; TLS/HTTP runs on core 0.
   CloudSync.loop();
 
-  // Poll cloud commands and refresh device presence every ~15s. This keeps
-  // dashboard actions responsive without issuing a heartbeat on every loop.
+  // Submit a lightweight device snapshot to the background network worker every ~15s.
   static unsigned long lastCloudHb = 0;
   if (CloudSync.isEnabled() && millis() - lastCloudHb >= 15000UL) {
     lastCloudHb = millis();
@@ -416,6 +452,7 @@ void loop() {
     );
   }
 
+  serviceCloudRestartAfterAck();
   servicePendingRestart();
   delay(1);
 }
@@ -673,9 +710,13 @@ static void handleCloudCommand(const char* commandId, const char* command, const
   }
 
   if (!strcmp(command, "restart")) {
+    strncpy(cloudRestartCommandId, commandId, sizeof(cloudRestartCommandId)-1);
+    cloudRestartCommandId[sizeof(cloudRestartCommandId)-1] = '\0';
+    cloudRestartAfterAck = true;
+    cloudRestartFallbackAtMs = millis() + CLOUD_TIMEOUT_MS + 1000UL;
     CloudSync.completeCommand(commandId, true, "{\"ok\":true,\"message\":\"restart_scheduled\"}");
     CloudSync.flushCommandAcks();
-    requestRestart(false);
+    Serial.println("[CLOUD] Restart queued; scanner loop continues while ACK runs in background.");
     return;
   }
 
