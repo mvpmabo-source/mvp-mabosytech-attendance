@@ -54,8 +54,8 @@
 #define MAX_LOGS 200  // full local-dashboard history cache
 #endif
 #define MAX_PENDING 32
-#define CHECKIN_ON_TIME_MINUTES 475
-#define CHECKOUT_ON_TIME_MINUTES 1020
+#define CHECKIN_ON_TIME_MINUTES 475  // 07:55 inclusive: on-time check-in
+#define CHECKOUT_ON_TIME_MINUTES 1020 // 17:00 inclusive: on-time check-out
 #define CFG_CHECKIN_KEY "cfg_checkin"
 #define CFG_CHECKOUT_KEY "cfg_checkout"
 #define CFG_DEVNAME_KEY "cfg_devname"
