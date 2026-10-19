@@ -1038,20 +1038,28 @@ bool CloudSyncClass::postJson(CloudJsonBodyBuilder bodyBuilder, const void* buil
 
   // Connect with TLS certificate validation (no setInsecure). Log only the host,
   // never credentials or the full request URL.
-  Serial.printf("[CLOUD] TLS target host=%s port=443\\n", host);
-  if (!_tls.connect(host, 443, CLOUD_TIMEOUT_MS)) {
-    char tlsError[160] = {0};
-    const int tlsErrorCode = _tls.lastError(tlsError, sizeof(tlsError));
-    Serial.printf("[CLOUD] TLS connection failed: code=%d detail=%s heap=%u maxAlloc=%u minFree=%u internalFree=%u internalMaxAlloc=%u\n",
-                  tlsErrorCode, tlsError[0] ? tlsError : "(no TLS detail)",
-                  (unsigned int)ESP.getFreeHeap(),
-                  (unsigned int)ESP.getMaxAllocHeap(),
-                  (unsigned int)ESP.getMinFreeHeap(),
-                  (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-                  (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    _tls.stop();  // Release any partial handshake state before the next retry.
-    if (httpStatusOut) *httpStatusOut = 0;
-    return false;
+  if (_tls.connected()) {
+    Serial.printf("[CLOUD] Reusing validated TLS connection; heap=%u maxAlloc=%u\n",
+                  (unsigned int)ESP.getFreeHeap(), (unsigned int)ESP.getMaxAllocHeap());
+  } else {
+    // Remove any stale socket/TLS context before a fresh handshake. Reusing a
+    // healthy keep-alive connection avoids repeated RSA/X.509 allocations.
+    _tls.stop();
+    Serial.printf("[CLOUD] TLS target host=%s port=443\n", host);
+    if (!_tls.connect(host, 443, CLOUD_TIMEOUT_MS)) {
+      char tlsError[160] = {0};
+      const int tlsErrorCode = _tls.lastError(tlsError, sizeof(tlsError));
+      Serial.printf("[CLOUD] TLS connection failed: code=%d detail=%s heap=%u maxAlloc=%u minFree=%u internalFree=%u internalMaxAlloc=%u\n",
+                    tlsErrorCode, tlsError[0] ? tlsError : "(no TLS detail)",
+                    (unsigned int)ESP.getFreeHeap(),
+                    (unsigned int)ESP.getMaxAllocHeap(),
+                    (unsigned int)ESP.getMinFreeHeap(),
+                    (unsigned int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                    (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+      _tls.stop();
+      if (httpStatusOut) *httpStatusOut = 0;
+      return false;
+    }
   }
 
   // Verify the TLS connection is actually established with a valid cert
@@ -1086,7 +1094,7 @@ bool CloudSyncClass::postJson(CloudJsonBodyBuilder bodyBuilder, const void* buil
     _tls.printf("apikey: %s\r\nAuthorization: Bearer %s\r\n",
                 CLOUD_PUBLIC_API_KEY, CLOUD_PUBLIC_API_KEY);
   }
-  _tls.print("Connection: close\r\n\r\n");
+  _tls.print("Connection: keep-alive\r\n\r\n");
   _tls.print(body);
 
   // Read complete HTTP lines only after bytes are actually available. Stream's
@@ -1149,6 +1157,7 @@ bool CloudSyncClass::postJson(CloudJsonBodyBuilder bodyBuilder, const void* buil
 
   // Parse headers and their framing metadata up to a genuine blank line.
   bool headersDone = false;
+  bool serverRequestedClose = false;
   while ((long)(deadline - millis()) > 0) {
     String header;
     if (!readHttpLine(header, 512)) break;
@@ -1167,7 +1176,9 @@ bool CloudSyncClass::postJson(CloudJsonBodyBuilder bodyBuilder, const void* buil
     key.toLowerCase();
     value.toLowerCase();
 
-    if (key == "transfer-encoding" && value.indexOf("chunked") >= 0) {
+    if (key == "connection" && value.indexOf("close") >= 0) {
+      serverRequestedClose = true;
+    } else if (key == "transfer-encoding" && value.indexOf("chunked") >= 0) {
       chunked = true;
     } else if (key == "content-length") {
       const long parsedLength = value.toInt();
@@ -1273,8 +1284,14 @@ bool CloudSyncClass::postJson(CloudJsonBodyBuilder bodyBuilder, const void* buil
     }
   }
 
-  _tls.stop();
   responseBody.trim();
+
+  // Retain a validated TLS session only when framing is complete and the
+  // server permits keep-alive. Explicit OTA takes the same mutex and stops
+  // this socket before creating its dedicated download client.
+  if (!ok || !bodyReadOk || serverRequestedClose || !_tls.connected()) {
+    _tls.stop();
+  }
 
   if (httpStatusOut) *httpStatusOut = httpStatus;
   if (responseOut) *responseOut = responseBody;
