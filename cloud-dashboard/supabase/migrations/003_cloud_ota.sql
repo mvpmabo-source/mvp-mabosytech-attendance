@@ -14,7 +14,7 @@ ALTER TABLE public.device_commands
 CREATE TABLE IF NOT EXISTS public.firmware_releases (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   version text NOT NULL UNIQUE
-    CHECK (version ~ '^V[0-9]+\.[0-9]+\.[0-9]+([+-][A-Za-z0-9.-]+)?),
+    CHECK (version ~ '^V[0-9]+\.[0-9]+\.[0-9]+([+-][A-Za-z0-9.-]+)?$'),
   storage_path text NOT NULL UNIQUE
     CHECK (storage_path ~ '^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}/[A-Za-z0-9._-]+\.bin$'),
   sha256 text NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
