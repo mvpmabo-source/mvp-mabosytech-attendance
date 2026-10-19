@@ -396,27 +396,24 @@ String getAttendanceStatus(bool isCheckIn) {
     return isCheckIn ? "CHECK IN - TIME UNKNOWN" : "CHECK OUT - TIME UNKNOWN";
   }
 
-  int currentMinutes = timeinfo.tm_hour * 60 + timeinfo.tm_min;
-  int checkinMin = CHECKIN_ON_TIME_MINUTES;
-  int checkoutMin = CHECKOUT_ON_TIME_MINUTES;
-
-  // Configuration is shared with the dashboard/runtime state. Snapshot the
-  // two values under the state mutex, then classify using the local copy.
-  if (lockState(100)) {
-    checkinMin = cfgCheckinMinutes;
-    checkoutMin = cfgCheckoutMinutes;
-    unlockState();
-  }
+  // Fixed attendance policy (Rwanda local time):
+  // Check-in: 00:00 through 07:55 inclusive => ON TIME; 07:56 onward => LATE.
+  // Check-out: before 17:00 => LEFT EARLY; 17:00 onward => ON TIME.
+  // Use the policy constants, not remotely editable legacy settings, so
+  // dashboard settings cannot silently change the agreed attendance rules.
+  const int currentMinutes = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+  const int checkinCutoff = CHECKIN_ON_TIME_MINUTES;   // 07:55 = minute 475
+  const int checkoutStart = CHECKOUT_ON_TIME_MINUTES; // 17:00 = minute 1020
 
   if (isCheckIn) {
-    if (currentMinutes < checkinMin) return "CHECK IN - EARLY";
-    if (currentMinutes == checkinMin) return "CHECK IN - ON TIME";
-    return "CHECK IN - LATE";
+    return currentMinutes <= checkinCutoff
+      ? "CHECK IN - ON TIME"
+      : "CHECK IN - LATE";
   }
 
-  if (currentMinutes < checkoutMin) return "CHECK OUT - LEFT EARLY";
-  if (currentMinutes == checkoutMin) return "CHECK OUT - ON TIME";
-  return "CHECK OUT - OVERTIME";
+  return currentMinutes >= checkoutStart
+    ? "CHECK OUT - ON TIME"
+    : "CHECK OUT - LEFT EARLY";
 }
 
 String attendanceEventTimeText(bool isCheckIn) {
