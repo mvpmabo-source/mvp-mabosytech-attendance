@@ -78,7 +78,7 @@ export function OverviewPage() {
     async function load() {
       try {
         const today = kigaliDateKey();
-        const [hbRes, todayRes, totalRes, todayInRes, todayOutRes] = await Promise.all([
+        const [hbRes, todayRes, totalRes, todayInRes, todayOutRes, teachersRes, todayEventsRes] = await Promise.all([
           supabase.from("device_heartbeats").select("*").order("received_at", { ascending: false }).limit(1).maybeSingle(),
           supabase.from("attendance_events").select("id", { count: "exact", head: true }).eq("event_date", today),
           supabase.from("attendance_events").select("id", { count: "exact", head: true }),
