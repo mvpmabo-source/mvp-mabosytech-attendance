@@ -128,14 +128,50 @@ void CloudSyncClass::begin(const char* deviceId, const char* apiKey) {
   _deviceId[sizeof(_deviceId) - 1] = '\0';
   strncpy(_apiKey, apiKey, sizeof(_apiKey) - 1);
   _apiKey[sizeof(_apiKey) - 1] = '\0';
-  _enabled = true;
 
-  // Use the ESP32 Arduino core's built-in Mozilla CA bundle. This avoids
-  // parsing multiple PEM roots into heap on every TLS connection, which
-  // previously failed with MBEDTLS_ERR_X509_ALLOC_FAILED on this device.
-  // Certificate-chain validation remains enabled; never use setInsecure().
+  _enqueueQueue = xQueueCreate(CLOUD_ENQUEUE_QUEUE_DEPTH, sizeof(CloudOutboxItem));
+  _heartbeatQueue = xQueueCreate(1, sizeof(CloudHeartbeatRequest));
+  _commandDispatchQueue = xQueueCreate(1, sizeof(CloudCommandDispatch));
+  _settingsDispatchQueue = xQueueCreate(1, sizeof(CloudSettingsDispatch));
+  _ackUpdateQueue = xQueueCreate(CLOUD_MAX_PENDING_CMDS, sizeof(CloudAckUpdate));
+
+  if (!_enqueueQueue || !_heartbeatQueue || !_commandDispatchQueue ||
+      !_settingsDispatchQueue || !_ackUpdateQueue) {
+    Serial.println("[CLOUD] ERROR: background-worker queues could not be allocated; cloud sync disabled.");
+    if (_enqueueQueue) vQueueDelete(_enqueueQueue);
+    if (_heartbeatQueue) vQueueDelete(_heartbeatQueue);
+    if (_commandDispatchQueue) vQueueDelete(_commandDispatchQueue);
+    if (_settingsDispatchQueue) vQueueDelete(_settingsDispatchQueue);
+    if (_ackUpdateQueue) vQueueDelete(_ackUpdateQueue);
+    _enqueueQueue = _heartbeatQueue = _commandDispatchQueue = nullptr;
+    _settingsDispatchQueue = _ackUpdateQueue = nullptr;
+    _enabled = false;
+    return;
+  }
+
+  // Keep strict certificate validation and the built-in root CA bundle.
+  // All potentially blocking TLS/HTTP calls are made only by cloudSync.
   _tls.useBuiltinCACertBundle();
-  Serial.println("[CLOUD] Built-in CA bundle enabled; TLS verification remains ON.");
+  _enabled = true;
+  const BaseType_t taskOk = xTaskCreatePinnedToCore(
+    CloudSyncClass::workerTaskEntry, "cloudSync", CLOUD_WORKER_STACK_BYTES,
+    this, 1, &_workerTask, 0
+  );
+  if (taskOk != pdPASS) {
+    Serial.println("[CLOUD] ERROR: background worker could not start; cloud sync disabled.");
+    if (_enqueueQueue) vQueueDelete(_enqueueQueue);
+    if (_heartbeatQueue) vQueueDelete(_heartbeatQueue);
+    if (_commandDispatchQueue) vQueueDelete(_commandDispatchQueue);
+    if (_settingsDispatchQueue) vQueueDelete(_settingsDispatchQueue);
+    if (_ackUpdateQueue) vQueueDelete(_ackUpdateQueue);
+    _enqueueQueue = _heartbeatQueue = _commandDispatchQueue = nullptr;
+    _settingsDispatchQueue = _ackUpdateQueue = nullptr;
+    _workerTask = nullptr;
+    _enabled = false;
+    return;
+  }
+  Serial.printf("[CLOUD] Background worker started on core 0; freeHeap=%u maxAlloc=%u\n",
+                (unsigned int)ESP.getFreeHeap(), (unsigned int)ESP.getMaxAllocHeap());
 }
 
 // ──────────────────────────────────────────────
@@ -157,57 +193,52 @@ void CloudSyncClass::enqueueAttendance(
   const char* name, const char* collegeId, const char* role,
   const char* department, const char* eventType, const char* status
 ) {
-  if (!_enabled) return;
+  if (!_enabled || !_enqueueQueue) return;
 
-  // Build the outbox item
-  CloudOutboxItem item;
-  memset(&item, 0, sizeof(item));
+  CloudOutboxItem item{};
   char eventUid[48];
-  generateEventUid(eventUid, sizeof(eventUid), date, timeStr, fingerprintId);
-  strncpy(item.date, date, sizeof(item.date) - 1);
-  item.date[sizeof(item.date) - 1] = '\0';
-  strncpy(item.timeStr, timeStr, sizeof(item.timeStr) - 1);
-  item.timeStr[sizeof(item.timeStr) - 1] = '\0';
+  generateEventUid(eventUid, sizeof(eventUid), date ? date : "", timeStr ? timeStr : "", fingerprintId);
+  strncpy(item.date, date ? date : "", sizeof(item.date) - 1);
+  strncpy(item.timeStr, timeStr ? timeStr : "", sizeof(item.timeStr) - 1);
   item.fingerprintId = fingerprintId;
   strncpy(item.name, name ? name : "", sizeof(item.name) - 1);
-  item.name[sizeof(item.name) - 1] = '\0';
   strncpy(item.collegeId, collegeId ? collegeId : "", sizeof(item.collegeId) - 1);
-  item.collegeId[sizeof(item.collegeId) - 1] = '\0';
   strncpy(item.role, role ? role : "", sizeof(item.role) - 1);
-  item.role[sizeof(item.role) - 1] = '\0';
   strncpy(item.department, department ? department : "", sizeof(item.department) - 1);
-  item.department[sizeof(item.department) - 1] = '\0';
-  strncpy(item.eventType, eventType, sizeof(item.eventType) - 1);
-  item.eventType[sizeof(item.eventType) - 1] = '\0';
-  strncpy(item.status, status, sizeof(item.status) - 1);
-  item.status[sizeof(item.status) - 1] = '\0';
+  strncpy(item.eventType, eventType ? eventType : "", sizeof(item.eventType) - 1);
+  strncpy(item.status, status ? status : "", sizeof(item.status) - 1);
   item.retryCount = 0;
   item.nextAttempt = 0;
   item.uploaded = false;
 
-  // Keep the event in RAM even if the SD lock is busy or the card is absent.
-  // processOutbox() retries persistence and never uploads an unpersisted event.
-  item.persisted = sdAvailable && persistOutboxItem(item);
-  if (_outboxCount < CLOUD_OUTBOX_MAX) {
-    _outbox[_outboxCount++] = item;
-  } else if (item.persisted) {
-    Serial.println("[CLOUD] RAM outbox full; event remains durable on SD for later recovery.");
-  } else {
-    Serial.println("[CLOUD] CRITICAL: RAM outbox full and SD persistence failed; cloud copy could not be queued.");
+  // Durability-first when SD is immediately available; never wait behind sdTask
+  // on the attendance/main loop. Failed fast writes are retried by the worker.
+  item.persisted = sdAvailable && persistOutboxItem(item, 0);
+  if (xQueueSend(_enqueueQueue, &item, 0) == pdTRUE) {
+    if (_workerTask) xTaskNotifyGive(_workerTask);
+    Serial.printf("[CLOUD] Event queued uid=%s fp=%d type=%s persisted=%s\n",
+                  eventUid, fingerprintId, item.eventType, item.persisted ? "yes" : "pending");
+    return;
   }
 
-  Serial.printf("[CLOUD] Enqueued event uid=%s fp=%d type=%s\n", eventUid, fingerprintId, eventType);
+  if (item.persisted || persistOutboxItem(item, 10)) {
+    Serial.printf("[CLOUD] Event uid=%s retained durably on SD; enqueue queue is full.\n", eventUid);
+    if (_workerTask) xTaskNotifyGive(_workerTask);
+  } else {
+    Serial.printf("[CLOUD] CRITICAL: local attendance is saved, but cloud outbox queue and SD fallback failed for uid=%s.\n",
+                  eventUid);
+  }
 }
 
 // ──────────────────────────────────────────────
 // SD persistent outbox helpers
 // ──────────────────────────────────────────────
 
-bool CloudSyncClass::persistOutboxItem(const CloudOutboxItem& item) {
+bool CloudSyncClass::persistOutboxItem(const CloudOutboxItem& item, uint32_t lockTimeoutMs) {
   if (!sdAvailable) return false;
 
-  // SD access is serialized against sdTask; fail fast if busy.
-  if (!lockCloudSd(1000)) return false;
+  // The main-loop path passes zero to avoid waiting; worker retries are bounded.
+  if (!lockCloudSd(lockTimeoutMs)) return false;
   // Create and initialize a new outbox explicitly before opening append mode.
   if (!SD.exists(CLOUD_OUTBOX_FILE)) {
     File init = SD.open(CLOUD_OUTBOX_FILE, FILE_WRITE);
@@ -457,9 +488,9 @@ bool CloudSyncClass::loadOutboxFromSD() {
 }
 
 void CloudSyncClass::recoverOutboxFromSD() {
-  if (!_enabled || !sdAvailable) return;
-  recoverOutboxFiles();
-  loadOutboxFromSD();
+  if (!_enabled || !_workerTask) return;
+  _recoveryRequested = true;
+  xTaskNotifyGive(_workerTask);
 }
 
 // ──────────────────────────────────────────────
@@ -473,23 +504,54 @@ void CloudSyncClass::sendHeartbeat(
   int pendingCount, const char* checkinTime, const char* checkoutTime,
   const char* deviceName, bool isEnrolling, bool fpOk
 ) {
-  if (!_enabled) return;
-
-  // Send any pending command acks first
-  sendCommandAcks();
-
-  const HeartbeatBodyContext payload = {
-    _deviceId, _apiKey, fwVersion, wifiOk, ip, rssi, freeHeap, sdOk,
-    rtcOk, rtcValid, templates, capacity, entryCount, exitCount, pendingCount,
-    checkinTime, checkoutTime, deviceName, isEnrolling, fpOk
+  if (!_enabled || !_heartbeatQueue) return;
+  CloudHeartbeatRequest request{};
+  auto copyField = [](char* target, size_t targetSize, const char* value) {
+    if (!target || targetSize == 0) return;
+    strncpy(target, value ? value : "", targetSize - 1);
+    target[targetSize - 1] = '\0';
   };
+  copyField(request.fwVersion, sizeof(request.fwVersion), fwVersion);
+  copyField(request.ip, sizeof(request.ip), ip);
+  copyField(request.checkinTime, sizeof(request.checkinTime), checkinTime);
+  copyField(request.checkoutTime, sizeof(request.checkoutTime), checkoutTime);
+  copyField(request.deviceName, sizeof(request.deviceName), deviceName);
+  request.rssi = rssi;
+  request.freeHeap = freeHeap;
+  request.templates = templates;
+  request.capacity = capacity;
+  request.entryCount = entryCount;
+  request.exitCount = exitCount;
+  request.pendingCount = pendingCount;
+  request.wifiOk = wifiOk;
+  request.sdOk = sdOk;
+  request.rtcOk = rtcOk;
+  request.rtcValid = rtcValid;
+  request.isEnrolling = isEnrolling;
+  request.fpOk = fpOk;
 
+  // One-slot mailbox coalesces heartbeat snapshots while TLS is busy.
+  if (xQueueOverwrite(_heartbeatQueue, &request) != pdPASS) {
+    Serial.println("[CLOUD] Heartbeat mailbox unavailable; snapshot not queued.");
+    return;
+  }
+  if (_workerTask) xTaskNotifyGive(_workerTask);
+}
+
+void CloudSyncClass::sendHeartbeatRequest(const CloudHeartbeatRequest& request) {
+  const HeartbeatBodyContext payload = {
+    _deviceId, _apiKey, request.fwVersion, request.wifiOk, request.ip,
+    request.rssi, request.freeHeap, request.sdOk, request.rtcOk, request.rtcValid,
+    request.templates, request.capacity, request.entryCount, request.exitCount,
+    request.pendingCount, request.checkinTime, request.checkoutTime,
+    request.deviceName, request.isEnrolling, request.fpOk
+  };
   String response;
   int httpStatus = 0;
   if (postJson(buildHeartbeatBody, &payload, &response, &httpStatus)) {
     processHeartbeatResponse(response);
   } else {
-    Serial.printf("[CLOUD] Heartbeat failed (HTTP %d)\n", httpStatus);
+    Serial.printf("[CLOUD] Heartbeat failed (HTTP %d); next queued snapshot will retry.\n", httpStatus);
   }
 }
 
@@ -520,16 +582,20 @@ void CloudSyncClass::processHeartbeatResponse(const String& response) {
     return;
   }
 
-  // Some cloud deployments also return the persisted device settings alongside commands.
-  // Apply them through a callback so the app can validate and persist them on the main loop.
-  if (_settingsCallback && !doc["settings"].isNull()) {
+  // Settings writes stay in the Arduino/main-loop context.
+  JsonVariantConst settingsValue = doc["settings"];
+  if (settingsValue.isNull()) settingsValue = doc["device_settings"];
+  if (!settingsValue.isNull() && _settingsDispatchQueue) {
     String settingsPayload;
-    serializeJson(doc["settings"], settingsPayload);
-    _settingsCallback(settingsPayload.c_str());
-  } else if (_settingsCallback && !doc["device_settings"].isNull()) {
-    String settingsPayload;
-    serializeJson(doc["device_settings"], settingsPayload);
-    _settingsCallback(settingsPayload.c_str());
+    serializeJson(settingsValue, settingsPayload);
+    CloudSettingsDispatch settingsMessage{};
+    if (settingsPayload.length() < sizeof(settingsMessage.json)) {
+      strncpy(settingsMessage.json, settingsPayload.c_str(), sizeof(settingsMessage.json)-1);
+      xQueueOverwrite(_settingsDispatchQueue, &settingsMessage);
+    } else {
+      Serial.printf("[CLOUD] Settings payload too large to dispatch (%u bytes); ignored.\n",
+                    (unsigned)settingsPayload.length());
+    }
   }
 
   JsonArray cmds = doc["pending_commands"].as<JsonArray>();
@@ -580,71 +646,203 @@ void CloudSyncClass::processHeartbeatResponse(const String& response) {
     }
     _pendingAcks[slot].ackReady = false;
     _pendingAcks[slot].succeeded = false;
-    Serial.printf("[CLOUD] Command received id=%s type=%s\n", id.c_str(), command);
-    if (_commandCallback) {
-      _commandCallback(_pendingAcks[slot].id, _pendingAcks[slot].command, _pendingAcks[slot].payload);
-    } else {
-      completeCommand(id.c_str(), false, "{\"error\":\"No command handler registered\"}");
+    CloudCommandDispatch dispatch{};
+    strncpy(dispatch.id, _pendingAcks[slot].id, sizeof(dispatch.id)-1);
+    strncpy(dispatch.command, _pendingAcks[slot].command, sizeof(dispatch.command)-1);
+    strncpy(dispatch.payload, _pendingAcks[slot].payload, sizeof(dispatch.payload)-1);
+    if (!_commandDispatchQueue || xQueueSend(_commandDispatchQueue, &dispatch, 0) != pdTRUE) {
+      Serial.println("[CLOUD] Main-loop command queue is full; command remains pending on server.");
+      memset(&_pendingAcks[slot], 0, sizeof(_pendingAcks[slot]));
+      _pendingAckCount--;
+      break;
     }
-    // The first command may still be running (e.g. enrollment). Never dispatch
-    // another command from this response, even if its handler returns quickly.
+    Serial.printf("[CLOUD] Command queued for main loop id=%s type=%s\n", id.c_str(), command);
     break;
   }
 }
 
 void CloudSyncClass::completeCommand(const char* commandId, bool success, const char* resultJson) {
-  if (!commandId || !commandId[0]) return;
-  for (int i = 0; i < _pendingAckCount; i++) {
-    if (strcmp(_pendingAcks[i].id, commandId) != 0) continue;
-    _pendingAcks[i].succeeded = success;
-    _pendingAcks[i].ackReady = true;
-    if (resultJson && resultJson[0]) {
-      strncpy(_pendingAcks[i].result, resultJson, sizeof(_pendingAcks[i].result)-1);
-    } else {
-      strcpy(_pendingAcks[i].result, success ? "{\"ok\":true}" : "{\"ok\":false}");
-    }
+  if (!commandId || !commandId[0] || !_ackUpdateQueue) return;
+  CloudAckUpdate update{};
+  strncpy(update.id, commandId, sizeof(update.id)-1);
+  update.success = success;
+  if (resultJson && resultJson[0]) {
+    strncpy(update.result, resultJson, sizeof(update.result)-1);
+  } else {
+    strncpy(update.result, success ? "{\"ok\":true}" : "{\"ok\":false}", sizeof(update.result)-1);
+  }
+  if (xQueueSend(_ackUpdateQueue, &update, 0) != pdTRUE) {
+    Serial.printf("[CLOUD] CRITICAL: command ack-update queue is full for id=%s.\n", commandId);
     return;
   }
+  if (_workerTask) xTaskNotifyGive(_workerTask);
 }
 
 void CloudSyncClass::flushCommandAcks() {
-  sendCommandAcks();
+  if (_workerTask) xTaskNotifyGive(_workerTask);
+}
+
+int CloudSyncClass::pendingCount() const {
+  const int queued = _enqueueQueue ? (int)uxQueueMessagesWaiting(_enqueueQueue) : 0;
+  return (int)_pendingCountSnapshot + queued;
+}
+
+void CloudSyncClass::serviceQueuedEvents() {
+  if (!_enqueueQueue) return;
+  CloudOutboxItem item;
+  while (xQueueReceive(_enqueueQueue, &item, 0) == pdTRUE) {
+    if (!item.persisted) item.persisted = sdAvailable && persistOutboxItem(item, 1000);
+    if (_outboxCount < CLOUD_OUTBOX_MAX) {
+      _outbox[_outboxCount++] = item;
+      continue;
+    }
+    if (item.persisted) {
+      Serial.printf("[CLOUD] RAM outbox full; event fp=%u remains durable on SD.\n",
+                    (unsigned)item.fingerprintId);
+      continue;
+    }
+    if (xQueueSendToFront(_enqueueQueue, &item, 0) != pdTRUE &&
+        !persistOutboxItem(item, 10)) {
+      Serial.printf("[CLOUD] CRITICAL: unable to retain cloud event fp=%u after SD/queue pressure.\n",
+                    (unsigned)item.fingerprintId);
+    }
+    break;
+  }
+}
+
+void CloudSyncClass::serviceAckUpdates() {
+  if (!_ackUpdateQueue) return;
+  CloudAckUpdate update;
+  while (xQueueReceive(_ackUpdateQueue, &update, 0) == pdTRUE) {
+    bool found = false;
+    for (int i = 0; i < _pendingAckCount; ++i) {
+      if (strcmp(_pendingAcks[i].id, update.id) != 0) continue;
+      _pendingAcks[i].succeeded = update.success;
+      _pendingAcks[i].ackReady = true;
+      strncpy(_pendingAcks[i].result, update.result, sizeof(_pendingAcks[i].result)-1);
+      _pendingAcks[i].result[sizeof(_pendingAcks[i].result)-1] = '\0';
+      _ackRetryAtMs = millis();
+      _ackRetryCount = 0;
+      found = true;
+      break;
+    }
+    if (!found) Serial.printf("[CLOUD] Ack completion arrived after command slot was gone: id=%s\n", update.id);
+  }
+}
+
+bool CloudSyncClass::hasReadyAck() const {
+  for (int i = 0; i < _pendingAckCount; ++i) if (_pendingAcks[i].ackReady) return true;
+  return false;
 }
 
 void CloudSyncClass::sendCommandAcks() {
-  int writeIndex = 0;
-  for (int i = 0; i < _pendingAckCount; i++) {
-    if (!_pendingAcks[i].ackReady) {
-      if (writeIndex != i) _pendingAcks[writeIndex] = _pendingAcks[i];
-      writeIndex++;
-      continue;
-    }
-    const CommandAckBodyContext payload = {_deviceId, _apiKey, &_pendingAcks[i]};
-    int status = 0;
-    if (postJson(buildCommandAckBody, &payload, nullptr, &status) && status >= 200 && status < 300) {
-      Serial.printf("[CLOUD] Command ack sent id=%s status=%s\n", _pendingAcks[i].id,
-                    _pendingAcks[i].succeeded ? "acknowledged" : "failed");
-    } else {
-      if (writeIndex != i) _pendingAcks[writeIndex] = _pendingAcks[i];
-      writeIndex++;
-      Serial.printf("[CLOUD] Command ack failed id=%s HTTP=%d; will retry\n", _pendingAcks[i].id, status);
-    }
+  int readyIndex = -1;
+  for (int i = 0; i < _pendingAckCount; ++i) {
+    if (_pendingAcks[i].ackReady) { readyIndex = i; break; }
   }
-  _pendingAckCount = writeIndex;
+  if (readyIndex < 0) return;
+  const CloudPendingCommand ackToSend = _pendingAcks[readyIndex];
+  const CommandAckBodyContext payload = {_deviceId, _apiKey, &ackToSend};
+  int status = 0;
+  if (postJson(buildCommandAckBody, &payload, nullptr, &status) && status >= 200 && status < 300) {
+    for (int i = 0; i < _pendingAckCount; ++i) {
+      if (strcmp(_pendingAcks[i].id, ackToSend.id) != 0) continue;
+      for (int j = i + 1; j < _pendingAckCount; ++j) _pendingAcks[j - 1] = _pendingAcks[j];
+      _pendingAckCount--;
+      break;
+    }
+    _ackRetryAtMs = 0;
+    _ackRetryCount = 0;
+    Serial.printf("[CLOUD] Command ack confirmed by server id=%s status=%s\n",
+                  ackToSend.id, ackToSend.succeeded ? "acknowledged" : "failed");
+    if (_ackSentCallback) _ackSentCallback(ackToSend.id);
+  } else {
+    if (_ackRetryCount < 5) _ackRetryCount++;
+    const uint32_t backoffMs = 1000UL << _ackRetryCount;
+    _ackRetryAtMs = millis() + backoffMs;
+    Serial.printf("[CLOUD] Command ack failed id=%s HTTP=%d; retry in %lu ms.\n",
+                  ackToSend.id, status, (unsigned long)backoffMs);
+  }
 }
 
-// ──────────────────────────────────────────────
-// Main loop — drain outbox periodically
-// ──────────────────────────────────────────────
+void CloudSyncClass::workerTaskEntry(void* argument) {
+  if (!argument) { vTaskDelete(nullptr); return; }
+  static_cast<CloudSyncClass*>(argument)->workerTaskLoop();
+  vTaskDelete(nullptr);
+}
+
+void CloudSyncClass::workerTaskLoop() {
+  for (;;) {
+    if (!_enabled) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
+
+    if (_recoveryRequested) {
+      _recoveryRequested = false;
+      if (sdAvailable) {
+        recoverOutboxFiles();
+        loadOutboxFromSD();
+      } else {
+        Serial.println("[CLOUD] SD unavailable during outbox recovery; local attendance remains independent.");
+      }
+      _outboxReady = true;
+      _pendingCountSnapshot = _outboxCount;
+      Serial.printf("[CLOUD] Async outbox recovery finished; RAM window=%d pending queue=%u.\n",
+                    _outboxCount, (unsigned)(_enqueueQueue ? uxQueueMessagesWaiting(_enqueueQueue) : 0));
+    }
+
+    if (!_outboxReady) { ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100)); continue; }
+
+    CloudHeartbeatRequest incomingHeartbeat{};
+    if (_heartbeatQueue && xQueueReceive(_heartbeatQueue, &incomingHeartbeat, 0) == pdTRUE) {
+      _latestHeartbeat = incomingHeartbeat;
+      _heartbeatPending = true;
+    }
+
+    serviceQueuedEvents();
+    serviceAckUpdates();
+
+    const uint32_t now = millis();
+    const bool networkReady = WiFi.status() == WL_CONNECTED;
+    if (!networkReady) {
+      if (_lastOfflineLogMs == 0 || now - _lastOfflineLogMs >= 30000UL) {
+        _lastOfflineLogMs = now;
+        Serial.println("[CLOUD] Wi-Fi offline; events remain queued and will retry after reconnect.");
+      }
+    } else {
+      _lastOfflineLogMs = 0;
+      if (hasReadyAck() && (int32_t)(now - _ackRetryAtMs) >= 0) {
+        sendCommandAcks();
+      } else {
+        const bool outboxDue = (uint32_t)(now - _lastSyncMs) >= CLOUD_SYNC_INTERVAL_MS;
+        if (outboxDue && (_preferOutbox || !_heartbeatPending)) {
+          _lastSyncMs = now;
+          _preferOutbox = false;
+          processOutbox();
+        } else if (_heartbeatPending) {
+          _heartbeatPending = false;
+          _preferOutbox = true;
+          sendHeartbeatRequest(_latestHeartbeat);
+        } else if (outboxDue) {
+          _lastSyncMs = now;
+          _preferOutbox = false;
+          processOutbox();
+        }
+      }
+    }
+    _pendingCountSnapshot = _outboxCount;
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5));
+  }
+}
 
 void CloudSyncClass::loop() {
   if (!_enabled) return;
-
-  unsigned long now = millis();
-
-  if (now - _lastSyncMs >= CLOUD_SYNC_INTERVAL_MS) {
-    _lastSyncMs = now;
-    processOutbox();
+  CloudSettingsDispatch settings{};
+  if (_settingsDispatchQueue && xQueueReceive(_settingsDispatchQueue, &settings, 0) == pdTRUE) {
+    if (_settingsCallback) _settingsCallback(settings.json);
+  }
+  CloudCommandDispatch command{};
+  if (_commandDispatchQueue && xQueueReceive(_commandDispatchQueue, &command, 0) == pdTRUE) {
+    if (_commandCallback) _commandCallback(command.id, command.command, command.payload);
+    else completeCommand(command.id, false, "{\"error\":\"No command handler registered\"}");
   }
 }
 
