@@ -83,7 +83,7 @@ struct CloudOutboxItem {
 struct CloudPendingCommand {
   char id[40];          // UUID from device_commands.id (or a legacy numeric ID)
   char command[32];
-  char payload[768]; // can carry a short-lived signed Cloud OTA URL    // serialized JSON payload
+  char payload[768];    // serialized JSON payload; can carry a short-lived signed OTA URL
   char result[128];     // serialized result JSON for the dashboard
   bool ackReady;
   bool succeeded;
