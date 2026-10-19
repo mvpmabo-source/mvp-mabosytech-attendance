@@ -134,15 +134,18 @@ void CloudSyncClass::begin(const char* deviceId, const char* apiKey) {
   _commandDispatchQueue = xQueueCreate(1, sizeof(CloudCommandDispatch));
   _settingsDispatchQueue = xQueueCreate(1, sizeof(CloudSettingsDispatch));
   _ackUpdateQueue = xQueueCreate(CLOUD_MAX_PENDING_CMDS, sizeof(CloudAckUpdate));
+  _networkMutex = xSemaphoreCreateMutex();
 
   if (!_enqueueQueue || !_heartbeatQueue || !_commandDispatchQueue ||
-      !_settingsDispatchQueue || !_ackUpdateQueue) {
+      !_settingsDispatchQueue || !_ackUpdateQueue || !_networkMutex) {
     Serial.println("[CLOUD] ERROR: background-worker queues could not be allocated; cloud sync disabled.");
     if (_enqueueQueue) vQueueDelete(_enqueueQueue);
     if (_heartbeatQueue) vQueueDelete(_heartbeatQueue);
     if (_commandDispatchQueue) vQueueDelete(_commandDispatchQueue);
     if (_settingsDispatchQueue) vQueueDelete(_settingsDispatchQueue);
     if (_ackUpdateQueue) vQueueDelete(_ackUpdateQueue);
+    if (_networkMutex) vSemaphoreDelete(_networkMutex);
+    _networkMutex = nullptr;
     _enqueueQueue = _heartbeatQueue = _commandDispatchQueue = nullptr;
     _settingsDispatchQueue = _ackUpdateQueue = nullptr;
     _enabled = false;
@@ -164,6 +167,8 @@ void CloudSyncClass::begin(const char* deviceId, const char* apiKey) {
     if (_commandDispatchQueue) vQueueDelete(_commandDispatchQueue);
     if (_settingsDispatchQueue) vQueueDelete(_settingsDispatchQueue);
     if (_ackUpdateQueue) vQueueDelete(_ackUpdateQueue);
+    if (_networkMutex) vSemaphoreDelete(_networkMutex);
+    _networkMutex = nullptr;
     _enqueueQueue = _heartbeatQueue = _commandDispatchQueue = nullptr;
     _settingsDispatchQueue = _ackUpdateQueue = nullptr;
     _workerTask = nullptr;
@@ -172,6 +177,20 @@ void CloudSyncClass::begin(const char* deviceId, const char* apiKey) {
   }
   Serial.printf("[CLOUD] Background worker started on core 0; freeHeap=%u maxAlloc=%u\n",
                 (unsigned int)ESP.getFreeHeap(), (unsigned int)ESP.getMaxAllocHeap());
+}
+
+bool CloudSyncClass::beginExclusiveNetworkOperation(uint32_t timeoutMs) {
+  if (!_enabled || !_networkMutex) return false;
+  if (xSemaphoreTake(_networkMutex, pdMS_TO_TICKS(timeoutMs)) != pdTRUE) {
+    Serial.println("[CLOUD] Exclusive TLS slot busy; refusing OTA start so attendance/network state is not corrupted.");
+    return false;
+  }
+  Serial.println("[CLOUD] Exclusive TLS slot acquired for Cloud OTA.");
+  return true;
+}
+
+void CloudSyncClass::endExclusiveNetworkOperation() {
+  if (_networkMutex) xSemaphoreGive(_networkMutex);
 }
 
 // ──────────────────────────────────────────────
@@ -971,6 +990,18 @@ void CloudSyncClass::processOutbox() {
 // ──────────────────────────────────────────────
 
 bool CloudSyncClass::postJson(CloudJsonBodyBuilder bodyBuilder, const void* builderContext, String* responseOut, int* httpStatusOut) {
+  // Only one TLS handshake may use the ESP32's constrained internal heap at
+  // a time. Cloud OTA takes this same mutex before opening its own HTTPS client.
+  if (!_networkMutex || xSemaphoreTake(_networkMutex, pdMS_TO_TICKS(1200)) != pdTRUE) {
+    if (httpStatusOut) *httpStatusOut = 0;
+    Serial.println("[CLOUD] TLS slot unavailable (another verified HTTPS transfer is active); request deferred for retry.");
+    return false;
+  }
+  struct NetworkMutexRelease {
+    SemaphoreHandle_t mutex;
+    ~NetworkMutexRelease() { if (mutex) xSemaphoreGive(mutex); }
+  } networkMutexRelease{_networkMutex};
+
   // TLS handshakes require a large contiguous internal-RAM allocation.
   // Log both total and largest-block heap to distinguish low memory from
   // fragmentation without weakening certificate verification.
