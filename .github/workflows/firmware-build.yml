@@ -2,6 +2,11 @@ name: ESP32 firmware build
 
 on:
   push:
+    branches: [phase-3-firmware-cloud-sync, feature/cloud-ota]
+    paths:
+      - "firmware/AttendanceSystem/**"
+      - ".github/workflows/firmware-build.yml"
+  pull_request:
     branches: [phase-3-firmware-cloud-sync]
     paths:
       - "firmware/AttendanceSystem/**"
@@ -14,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: phase-3-firmware-cloud-sync
+          ref: ${{ github.sha }}
       - uses: arduino/setup-arduino-cli@v2
       - name: Install ESP32 Arduino core
         run: |
