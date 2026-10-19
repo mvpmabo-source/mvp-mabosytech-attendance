@@ -141,6 +141,11 @@ typedef void (*CloudCommandAckSentCallback)(const char* commandId);
 class CloudSyncClass {
 public:
   void begin(const char* deviceId, const char* apiKey);
+  // Acquires the single network/TLS slot for a deliberate OTA download.
+  // Fail fast if cloud sync is busy; regular attendance must not wait for cloud I/O.
+  bool beginExclusiveNetworkOperation(uint32_t timeoutMs = 1500);
+  void endExclusiveNetworkOperation();
+
   void loop();
   bool isEnabled() const { return _enabled; }
 
@@ -175,6 +180,7 @@ private:
   char _deviceId[32];
   char _apiKey[80];
   WiFiClientSecure _tls;
+  SemaphoreHandle_t _networkMutex = nullptr; // serialize cloud HTTPS and explicit Cloud OTA
   CloudCommandCallback _commandCallback = nullptr;
   CloudSettingsCallback _settingsCallback = nullptr;
   CloudCommandAckSentCallback _ackSentCallback = nullptr;
