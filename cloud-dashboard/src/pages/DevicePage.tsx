@@ -87,6 +87,12 @@ export function DevicePage() {
     setError(null);
     setFirmwareMessage(null);
     try {
+      if (!user?.id) throw new Error("Dashboard session is unavailable. Sign in again before uploading firmware.");
+      const { data: existingRelease, error: existingReleaseError } = await supabase
+        .from("firmware_releases").select("id").eq("version", version).maybeSingle();
+      if (existingReleaseError) throw new Error(`Cloud OTA migration is missing or unavailable: ${existingReleaseError.message}`);
+      if (existingRelease) throw new Error(`Release version ${version} already exists. Choose a new unique version.`);
+
       const digestBuffer = await crypto.subtle.digest("SHA-256", await firmwareFile.arrayBuffer());
       const sha256 = Array.from(new Uint8Array(digestBuffer))
         .map((value) => value.toString(16).padStart(2, "0")).join("");
@@ -124,6 +130,14 @@ export function DevicePage() {
   async function deployFirmwareRelease(release: FirmwareRelease) {
     if (!device?.device_id && !heartbeat?.device_id) {
       setError("No registered device ID is available.");
+      return;
+    }
+    if (!deviceOnline) {
+      setError("The ESP32 must be online before you queue a cloud firmware update.");
+      return;
+    }
+    if (heartbeat?.is_enrolling) {
+      setError("Cancel or finish fingerprint enrollment before starting a firmware update.");
       return;
     }
     const confirmed = window.confirm(
@@ -234,8 +248,8 @@ export function DevicePage() {
                   {release.release_notes && <p className="text-sm text-slate-600 mt-1">{release.release_notes}</p>}
                   <p className="text-xs font-mono text-slate-400 mt-1 break-all">SHA-256: {release.sha256}</p>
                 </div>
-                <button onClick={() => deployFirmwareRelease(release)} disabled={deployingVersion !== null || release.version === heartbeat?.firmware_version} className="shrink-0 inline-flex items-center justify-center gap-2 rounded-lg border border-sky-200 px-3 py-2 text-sm font-medium text-sky-700 hover:bg-sky-50 disabled:opacity-50">
-                  <Rocket className="w-4 h-4" />{deployingVersion === release.version ? "Queueing…" : release.version === heartbeat?.firmware_version ? "Already installed" : "Send to ESP32"}
+                <button onClick={() => deployFirmwareRelease(release)} disabled={!deviceOnline || !!heartbeat?.is_enrolling || deployingVersion !== null || release.version === heartbeat?.firmware_version} className="shrink-0 inline-flex items-center justify-center gap-2 rounded-lg border border-sky-200 px-3 py-2 text-sm font-medium text-sky-700 hover:bg-sky-50 disabled:opacity-50">
+                  <Rocket className="w-4 h-4" />{!deviceOnline ? "Device offline" : heartbeat?.is_enrolling ? "Enrollment active" : deployingVersion === release.version ? "Queueing…" : release.version === heartbeat?.firmware_version ? "Already installed" : "Send to ESP32"}
                 </button>
               </div>
             ))}
