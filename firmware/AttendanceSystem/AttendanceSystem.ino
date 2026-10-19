@@ -756,9 +756,20 @@ static void handleCloudCommand(const char* commandId, const char* command, const
       return;
     }
 
+    // Do not let the cloud worker and OTA downloader run TLS/RSA verification
+    // concurrently: the ESP32's internal heap is small and 0x4290 can mean
+    // RSA/MPI allocation failure during certificate signature verification.
+    if (!CloudSync.beginExclusiveNetworkOperation(1500)) {
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"cloud_tls_busy_retry_ota\"}");
+      CloudSync.flushCommandAcks();
+      oledErrorAnimation("OTA BUSY", "Retry in a moment");
+      return;
+    }
+
     const bool updated = performCloudFirmwareUpdate(
       targetVersion.c_str(), firmwareUrl.c_str(),
       expectedSha256.c_str(), expectedSize);
+    CloudSync.endExclusiveNetworkOperation();
 
     if (updated) {
       Serial.printf("[CLOUD OTA] Update to %s verified and staged; restart waits for ACK.\n",
