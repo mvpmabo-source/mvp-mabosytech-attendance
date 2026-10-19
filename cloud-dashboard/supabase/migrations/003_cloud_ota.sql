@@ -9,7 +9,7 @@ ALTER TABLE public.device_commands
 
 ALTER TABLE public.device_commands
   ADD CONSTRAINT device_commands_command_check
-  CHECK (command IN ('restart', 'sync_time', 'cloud_ota'));
+  CHECK (command IN ('restart', 'sync_time', 'update_settings', 'enroll_fingerprint', 'enroll', 'delete_fingerprint', 'delete_fingerprint_template', 'cloud_ota'));
 
 CREATE TABLE IF NOT EXISTS public.firmware_releases (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -31,7 +31,7 @@ CREATE POLICY "firmware_releases_select_authenticated"
 DROP POLICY IF EXISTS "firmware_releases_insert_authenticated" ON public.firmware_releases;
 CREATE POLICY "firmware_releases_insert_authenticated"
   ON public.firmware_releases FOR INSERT TO authenticated
-  WITH CHECK (uploaded_by IS NULL OR uploaded_by = auth.uid());
+  WITH CHECK (uploaded_by = auth.uid());
 
 REVOKE ALL ON public.firmware_releases FROM anon;
 GRANT SELECT, INSERT ON public.firmware_releases TO authenticated;
