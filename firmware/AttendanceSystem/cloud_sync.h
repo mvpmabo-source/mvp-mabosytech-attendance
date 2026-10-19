@@ -25,6 +25,8 @@
 #include <WiFiClientSecure.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
 #include "config.h"
 
 extern SemaphoreHandle_t cloudSdMutex;
@@ -51,6 +53,8 @@ inline void unlockCloudSd() {
 #define CLOUD_TIMEOUT_MS 15000UL
 #define CLOUD_BATCH_SIZE 5
 #define CLOUD_OUTBOX_MAX 12  // RAM window only; remaining pending events stay on SD
+#define CLOUD_ENQUEUE_QUEUE_DEPTH 16
+#define CLOUD_WORKER_STACK_BYTES 8192
 #define CLOUD_MAX_PENDING_CMDS 4  // extra commands remain pending on the server until a slot opens
 #define CLOUD_MAX_RETRIES 12
 #define CLOUD_OUTBOX_FILE "/cloud_outbox.csv"
@@ -79,10 +83,49 @@ struct CloudOutboxItem {
 struct CloudPendingCommand {
   char id[40];          // UUID from device_commands.id (or a legacy numeric ID)
   char command[32];
-  char payload[768]; // short-lived signed HTTPS OTA URL and release metadata    // serialized JSON payload
+  char payload[768]; // can carry a short-lived signed Cloud OTA URL    // serialized JSON payload
   char result[128];     // serialized result JSON for the dashboard
   bool ackReady;
   bool succeeded;
+};
+
+// Fixed-size messages cross task boundaries; temporary String buffers from
+// loop() are copied before the asynchronous network worker sees them.
+struct CloudHeartbeatRequest {
+  char fwVersion[24];
+  char ip[16];
+  char checkinTime[10];
+  char checkoutTime[10];
+  char deviceName[64];
+  int rssi;
+  int freeHeap;
+  int templates;
+  int capacity;
+  int entryCount;
+  int exitCount;
+  int pendingCount;
+  bool wifiOk;
+  bool sdOk;
+  bool rtcOk;
+  bool rtcValid;
+  bool isEnrolling;
+  bool fpOk;
+};
+
+struct CloudCommandDispatch {
+  char id[40];
+  char command[32];
+  char payload[768]; // can carry a short-lived signed Cloud OTA URL
+};
+
+struct CloudSettingsDispatch {
+  char json[768];
+};
+
+struct CloudAckUpdate {
+  char id[40];
+  char result[128];
+  bool success;
 };
 
 // A body builder runs only after the TLS handshake, keeping JSON allocations
@@ -93,6 +136,7 @@ typedef bool (*CloudJsonBodyBuilder)(String& body, const void* context);
 // long-running operation (such as fingerprint enrollment) actually finishes.
 typedef void (*CloudCommandCallback)(const char* commandId, const char* command, const char* payload);
 typedef void (*CloudSettingsCallback)(const char* settingsJson);
+typedef void (*CloudCommandAckSentCallback)(const char* commandId);
 
 class CloudSyncClass {
 public:
@@ -116,13 +160,14 @@ public:
 
   void onCommand(CloudCommandCallback cb) { _commandCallback = cb; }
   void onSettings(CloudSettingsCallback cb) { _settingsCallback = cb; }
+  void onCommandAckSent(CloudCommandAckSentCallback cb) { _ackSentCallback = cb; }
 
   void completeCommand(const char* commandId, bool success, const char* resultJson = nullptr);
   void flushCommandAcks();
 
-  int pendingCount() const { return _outboxCount; }
+  int pendingCount() const;
 
-  // Call after SD is mounted and ready. Loads any persisted pending events.
+  // Signals the worker to recover persisted events after SD boot preparation is complete.
   void recoverOutboxFromSD();
 
 private:
@@ -132,14 +177,38 @@ private:
   WiFiClientSecure _tls;
   CloudCommandCallback _commandCallback = nullptr;
   CloudSettingsCallback _settingsCallback = nullptr;
+  CloudCommandAckSentCallback _ackSentCallback = nullptr;
+
+  // The background worker exclusively owns the TLS client, RAM outbox and acks.
+  // The Arduino loop communicates with it only through bounded queues.
+  QueueHandle_t _enqueueQueue = nullptr;
+  QueueHandle_t _heartbeatQueue = nullptr;
+  QueueHandle_t _commandDispatchQueue = nullptr;
+  QueueHandle_t _settingsDispatchQueue = nullptr;
+  QueueHandle_t _ackUpdateQueue = nullptr;
+  TaskHandle_t _workerTask = nullptr;
+  volatile bool _recoveryRequested = false;
+  bool _outboxReady = false;
+  bool _heartbeatPending = false;
+  bool _preferOutbox = true;
+  CloudHeartbeatRequest _latestHeartbeat{};
+  volatile int _pendingCountSnapshot = 0;
+  unsigned long _lastSyncMs = 0;
+  unsigned long _ackRetryAtMs = 0;
+  uint8_t _ackRetryCount = 0;
+  unsigned long _lastOfflineLogMs = 0;
 
   CloudOutboxItem _outbox[CLOUD_OUTBOX_MAX];
   int _outboxCount = 0;
-
   CloudPendingCommand _pendingAcks[CLOUD_MAX_PENDING_CMDS];
   int _pendingAckCount = 0;
 
-  unsigned long _lastSyncMs = 0;
+  static void workerTaskEntry(void* argument);
+  void workerTaskLoop();
+  void serviceQueuedEvents();
+  void serviceAckUpdates();
+  bool hasReadyAck() const;
+  void sendHeartbeatRequest(const CloudHeartbeatRequest& request);
   bool postJson(CloudJsonBodyBuilder bodyBuilder, const void* builderContext, String* responseOut, int* httpStatusOut);
   void processOutbox();
   void generateEventUid(char* buf, size_t bufLen, const char* date, const char* timeStr, int fpId);
@@ -147,7 +216,7 @@ private:
   void sendCommandAcks();
 
   // SD persistent outbox helpers
-  bool persistOutboxItem(const CloudOutboxItem& item);
+  bool persistOutboxItem(const CloudOutboxItem& item, uint32_t lockTimeoutMs = 1000);
   bool compactOutboxFile();
   bool recoverOutboxFiles();
   bool loadOutboxFromSD();
