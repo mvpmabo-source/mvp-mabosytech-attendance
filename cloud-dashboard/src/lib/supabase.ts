@@ -65,12 +65,23 @@ export type Device = {
 export type DeviceCommand = {
   id: string;
   device_id: string;
-  command: "restart" | "sync_time";
+  command: "restart" | "sync_time" | "cloud_ota";
   payload: Record<string, unknown>;
   status: "pending" | "acknowledged" | "failed";
   created_by: string | null;
   created_at: string;
   acknowledged_at: string | null;
+};
+
+export type FirmwareRelease = {
+  id: string;
+  version: string;
+  storage_path: string;
+  sha256: string;
+  size_bytes: number;
+  release_notes: string | null;
+  uploaded_by: string | null;
+  created_at: string;
 };
 
 export type AuditLogEntry = {

@@ -1193,6 +1193,7 @@ void scanSdHistoryOnBootTask() {
   uint32_t records = 0; int entries = 0, exits = 0, lastEntry = -1;
   uint32_t todayLoaded = 0;
   const String todayDate = currentDateOnlyText();
+  if (todayDate.length() == 10) refreshDailyAttendanceStateForDate(todayDate.c_str());
   File f = SD.open(SD_LOG_FILE, FILE_READ);
   if (f) {
     sdReaderAttach(f);
@@ -1211,6 +1212,14 @@ void scanSdHistoryOnBootTask() {
         const bool checkIn = (fields[7] == "CHECK_IN");
         if (checkIn) { entries++; lastEntry=id; }
         else { exits++; }
+
+        // Rebuild only the current date's attendance flags from the durable
+        // CSV. Older days never force a new day to begin with CHECK_OUT.
+        if (todayDate.length() == 10 && fields[0] == todayDate && lockState(50)) {
+          if (checkIn) todayCheckInDone[id] = true;
+          else todayCheckOutDone[id] = true;
+          unlockState();
+        }
 
         // Cloud-only firmware keeps durable history on SD/cloud; rebuilding per-row String objects here fragments internal RAM needed by TLS. Counters above are still computed from every valid SD row.
         if (!CLOUD_ONLY_MODE && todayDate.length()==10 && fields[0] == todayDate) {

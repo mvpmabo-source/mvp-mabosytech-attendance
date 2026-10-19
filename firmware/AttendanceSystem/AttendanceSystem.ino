@@ -1,6 +1,7 @@
 #include "app.h"
 #include <esp_system.h>
 #include "mbedtls/sha256.h"
+#include "cloud_ota.h"
 #include <ArduinoJson.h>
 
 static void handleCloudCommand(const char* commandId, const char* command, const char* payload);
@@ -8,6 +9,42 @@ static void handleCloudSettings(const char* settingsJson);
 static char activeCloudEnrollCommandId[40] = "";
 static uint16_t pendingCloudEnrollTargetId = 0;
 static constexpr uint8_t CLOUD_FP_SLOT_EMPTY_CODE = 0x0C;
+
+static portMUX_TYPE cloudAckSentMux = portMUX_INITIALIZER_UNLOCKED;
+static char cloudAckSentCommandId[40] = "";
+static char cloudRestartCommandId[40] = "";
+static bool cloudRestartAfterAck = false;
+static unsigned long cloudRestartFallbackAtMs = 0;
+
+static void handleCloudCommandAckSent(const char* commandId) {
+  if (!commandId || !commandId[0]) return;
+  portENTER_CRITICAL(&cloudAckSentMux);
+  strncpy(cloudAckSentCommandId, commandId, sizeof(cloudAckSentCommandId)-1);
+  cloudAckSentCommandId[sizeof(cloudAckSentCommandId)-1] = '\0';
+  portEXIT_CRITICAL(&cloudAckSentMux);
+}
+
+static void serviceCloudRestartAfterAck() {
+  char acknowledgedId[sizeof(cloudAckSentCommandId)] = "";
+  portENTER_CRITICAL(&cloudAckSentMux);
+  strncpy(acknowledgedId, cloudAckSentCommandId, sizeof(acknowledgedId)-1);
+  cloudAckSentCommandId[0] = '\0';
+  portEXIT_CRITICAL(&cloudAckSentMux);
+  if (cloudRestartAfterAck && acknowledgedId[0] &&
+      strcmp(acknowledgedId, cloudRestartCommandId) == 0) {
+    cloudRestartAfterAck = false;
+    cloudRestartCommandId[0] = '\0';
+    Serial.println("[CLOUD] Restart ACK confirmed; scheduling device restart.");
+    requestRestart(false);
+    return;
+  }
+  if (cloudRestartAfterAck && (long)(millis() - cloudRestartFallbackAtMs) >= 0) {
+    cloudRestartAfterAck = false;
+    cloudRestartCommandId[0] = '\0';
+    Serial.println("[CLOUD] Restart ACK did not confirm before timeout; proceeding with bounded restart fallback.");
+    requestRestart(false);
+  }
+}
 
 // Fail closed: a dashboard-selected fingerprint slot may only be used when the
 // sensor positively reports that the slot is empty. UART errors are not "empty".
@@ -154,6 +191,7 @@ void setup() {
   CloudSync.begin(CLOUD_DEVICE_ID, CLOUD_API_KEY);
   CloudSync.onCommand(handleCloudCommand);
   CloudSync.onSettings(handleCloudSettings);
+  CloudSync.onCommandAckSent(handleCloudCommandAckSent);
   if (CloudSync.isEnabled())
     addLog("INFO", -1, "Cloud sync enabled");
   else
@@ -216,7 +254,7 @@ void loop() {
     cloudOutboxRecovered = true;
     if (CloudSync.isEnabled()) {
       CloudSync.recoverOutboxFromSD();
-      Serial.printf("[CLOUD] Outbox recovery done. Pending: %d\n", CloudSync.pendingCount());
+      Serial.printf("[CLOUD] Outbox recovery requested asynchronously. Pending: %d\n", CloudSync.pendingCount());
     }
   }
 
@@ -380,11 +418,10 @@ void loop() {
     }
   }
 
-  // ---- Cloud sync (non-blocking) ----
+  // CloudSync.loop dispatches callbacks only; TLS/HTTP runs on core 0.
   CloudSync.loop();
 
-  // Poll cloud commands and refresh device presence every ~15s. This keeps
-  // dashboard actions responsive without issuing a heartbeat on every loop.
+  // Submit a lightweight device snapshot to the background network worker every ~15s.
   static unsigned long lastCloudHb = 0;
   if (CloudSync.isEnabled() && millis() - lastCloudHb >= 15000UL) {
     lastCloudHb = millis();
@@ -416,6 +453,7 @@ void loop() {
     );
   }
 
+  serviceCloudRestartAfterAck();
   servicePendingRestart();
   delay(1);
 }
@@ -673,9 +711,82 @@ static void handleCloudCommand(const char* commandId, const char* command, const
   }
 
   if (!strcmp(command, "restart")) {
+    strncpy(cloudRestartCommandId, commandId, sizeof(cloudRestartCommandId)-1);
+    cloudRestartCommandId[sizeof(cloudRestartCommandId)-1] = '\0';
+    cloudRestartAfterAck = true;
+    cloudRestartFallbackAtMs = millis() + CLOUD_TIMEOUT_MS + 1000UL;
     CloudSync.completeCommand(commandId, true, "{\"ok\":true,\"message\":\"restart_scheduled\"}");
     CloudSync.flushCommandAcks();
-    requestRestart(false);
+    Serial.println("[CLOUD] Restart queued; scanner loop continues while ACK runs in background.");
+    return;
+  }
+
+  if (!strcmp(command, "cloud_ota")) {
+    const String targetVersion = data["version"] | "";
+    const String firmwareUrl = data["firmware_url"] | "";
+    const String expectedSha256 = data["sha256"] | "";
+    const size_t expectedSize = data["size_bytes"] | 0UL;
+    const String urlError = data["firmware_url_error"] | "";
+
+    if (targetVersion.length() == 0 || expectedSha256.length() != 64 || expectedSize == 0) {
+      Serial.printf("[CLOUD OTA] Invalid release metadata (version=%s size=%u sha_len=%u).\n",
+                    targetVersion.c_str(), (unsigned)expectedSize, (unsigned)expectedSha256.length());
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"invalid_firmware_release_metadata\"}");
+      CloudSync.flushCommandAcks();
+      return;
+    }
+    if (targetVersion == FIRMWARE_VERSION) {
+      Serial.printf("[CLOUD OTA] %s is already installed; skipping download.\n", targetVersion.c_str());
+      CloudSync.completeCommand(commandId, true, "{\"ok\":true,\"message\":\"already_on_target_version\"}");
+      CloudSync.flushCommandAcks();
+      return;
+    }
+    if (isEnrolling || dashboardEnrollRequest || activeCloudEnrollCommandId[0]) {
+      Serial.println("[CLOUD OTA] Rejected: fingerprint enrollment is active.");
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"enrollment_in_progress\"}");
+      CloudSync.flushCommandAcks();
+      return;
+    }
+    if (firmwareUrl.length() == 0) {
+      Serial.printf("[CLOUD OTA] Firmware URL unavailable: %s\n",
+                    urlError.length() ? urlError.c_str() : "missing_signed_url");
+      oledErrorAnimation("OTA FAILED", "Release URL unavailable");
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"firmware_download_url_unavailable\"}");
+      CloudSync.flushCommandAcks();
+      return;
+    }
+
+    // Do not let the cloud worker and OTA downloader run TLS/RSA verification
+    // concurrently: the ESP32's internal heap is small and 0x4290 can mean
+    // RSA/MPI allocation failure during certificate signature verification.
+    if (!CloudSync.beginExclusiveNetworkOperation(1500)) {
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"cloud_tls_busy_retry_ota\"}");
+      CloudSync.flushCommandAcks();
+      oledErrorAnimation("OTA BUSY", "Retry in a moment");
+      return;
+    }
+
+    const bool updated = performCloudFirmwareUpdate(
+      targetVersion.c_str(), firmwareUrl.c_str(),
+      expectedSha256.c_str(), expectedSize);
+    CloudSync.endExclusiveNetworkOperation();
+
+    if (updated) {
+      Serial.printf("[CLOUD OTA] Update to %s verified and staged; restart waits for ACK.\n",
+                    targetVersion.c_str());
+      strncpy(cloudRestartCommandId, commandId, sizeof(cloudRestartCommandId)-1);
+      cloudRestartCommandId[sizeof(cloudRestartCommandId)-1] = '\0';
+      cloudRestartAfterAck = true;
+      cloudRestartFallbackAtMs = millis() + CLOUD_TIMEOUT_MS + 1000UL;
+      CloudSync.completeCommand(commandId, true, "{\"ok\":true,\"message\":\"firmware_verified_restart_scheduled\"}");
+      CloudSync.flushCommandAcks();
+      Serial.println("[CLOUD OTA] ACK queued; attendance loop remains active while the cloud worker sends it.");
+      return;
+    }
+
+    CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"firmware_download_or_verification_failed\"}");
+    CloudSync.flushCommandAcks();
+    oledErrorAnimation("OTA FAILED", "Old firmware kept");
     return;
   }
 

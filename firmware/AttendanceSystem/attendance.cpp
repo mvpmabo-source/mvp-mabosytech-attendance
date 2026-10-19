@@ -259,6 +259,19 @@ static void addRecoveredAttendanceToRam(const String& row,uint32_t seq) {
   }
 }
 
+void refreshDailyAttendanceStateForDate(const char* ymd) {
+  if (!ymd || strlen(ymd) != 10) return;
+  if (!lockState(250)) return;
+  if (strncmp(attendanceBusinessDate, ymd, 10) != 0) {
+    strncpy(attendanceBusinessDate, ymd, sizeof(attendanceBusinessDate)-1);
+    attendanceBusinessDate[sizeof(attendanceBusinessDate)-1] = '\0';
+    memset(todayCheckInDone, 0, sizeof(todayCheckInDone));
+    memset(todayCheckOutDone, 0, sizeof(todayCheckOutDone));
+    Serial.printf("[ATTEND] New attendance day %s; daily check-in/check-out state reset.\\n", attendanceBusinessDate);
+  }
+  unlockState();
+}
+
 static bool applyAttendanceCommitState(const String& row,bool updateCounts) {
   String f[9];
   if(parseAttendanceCsvLine(row,f,9)!=9) return false;
@@ -271,10 +284,22 @@ static bool applyAttendanceCommitState(const String& row,bool updateCounts) {
     Serial.printf("[ATTEND] ERROR: failed to persist presence state for ID %d; transaction retained.\n", id);
     return false;
   }
+  const String todayDate = currentDateOnlyText();
+  const bool eventIsToday = (todayDate.length() == 10 && f[0] == todayDate);
   const unsigned long nowMs=millis();
   if(!lockState(250)) return false;
   insideState[id]=checkIn;
   lastAttendanceActionMs[id]=nowMs;
+  if (eventIsToday) {
+    if (strncmp(attendanceBusinessDate, f[0].c_str(), 10) != 0) {
+      strncpy(attendanceBusinessDate, f[0].c_str(), sizeof(attendanceBusinessDate)-1);
+      attendanceBusinessDate[sizeof(attendanceBusinessDate)-1] = '\0';
+      memset(todayCheckInDone, 0, sizeof(todayCheckInDone));
+      memset(todayCheckOutDone, 0, sizeof(todayCheckOutDone));
+    }
+    if (checkIn) todayCheckInDone[id] = true;
+    if (checkOut) todayCheckOutDone[id] = true;
+  }
   if(checkIn) { lastEntryId=id; if(updateCounts) entryCount++; }
   else if(checkOut && updateCounts) exitCount++;
   unlockState();

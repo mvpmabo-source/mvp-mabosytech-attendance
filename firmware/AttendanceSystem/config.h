@@ -54,8 +54,8 @@
 #define MAX_LOGS 200  // full local-dashboard history cache
 #endif
 #define MAX_PENDING 32
-#define CHECKIN_ON_TIME_MINUTES 475
-#define CHECKOUT_ON_TIME_MINUTES 1020
+#define CHECKIN_ON_TIME_MINUTES 475  // 07:55 inclusive: on-time check-in
+#define CHECKOUT_ON_TIME_MINUTES 1020 // 17:00 inclusive: on-time check-out
 #define CFG_CHECKIN_KEY "cfg_checkin"
 #define CFG_CHECKOUT_KEY "cfg_checkout"
 #define CFG_DEVNAME_KEY "cfg_devname"
@@ -68,7 +68,7 @@
 #define FP_SLEEP_PROBE_MS 400UL
 #define FP_PROBE_EXPOSURE_MS 60UL
 #define FP_TOUCH_STUCK_MS 30000UL
-#define FIRMWARE_VERSION "V2.9.45"
+#define FIRMWARE_VERSION "V2.10.51"
 
 // =====================================================
 // CLOUD SYNC CONFIGURATION

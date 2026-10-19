@@ -6,8 +6,8 @@
 // The ESP32 joins the existing office/router Wi-Fi as a STA.
 // The two credential macros live in config.h so they are easy to change
 // without touching the network implementation.
-const char* WIFI_SSID     = "WIFI YAWE";
-const char* WIFI_PASSWORD = "PASSWORD YAWE";
+const char* WIFI_SSID     = WIFI_SSID_VALUE;
+const char* WIFI_PASSWORD = WIFI_PASSWORD_VALUE;
 // Rwanda local time: Central Africa Time, UTC+2, no DST.
 // Kept as POSIX TZ form because the ESP32 time APIs use that representation.
 const char* TIME_ZONE     = "CAT-2";
@@ -261,6 +261,9 @@ String cachedRegisteredJson = "[]";
 uint16_t scanFirstFreeId = 1;
 int entryCount = 0, exitCount = 0, lastEntryId = -1, tickLastRamDroppedSeen = -1;
 bool insideState[MAX_FINGERPRINTS + 1];
+bool todayCheckInDone[MAX_FINGERPRINTS + 1] = {};
+bool todayCheckOutDone[MAX_FINGERPRINTS + 1] = {};
+char attendanceBusinessDate[11] = ""; // YYYY-MM-DD; flags are rebuilt from SD history at boot
 // Section 6 (duplicate protection): last time each fingerprint ID produced
 // an attendance record, used to debounce accidental repeated scans.
 unsigned long lastAttendanceActionMs[MAX_FINGERPRINTS + 1];

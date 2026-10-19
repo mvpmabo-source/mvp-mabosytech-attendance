@@ -63,24 +63,21 @@ static String attendanceStatusRwLabel(const String &event) {
   String e = event;
   e.toUpperCase();
 
-  // Check-out has a different Rwandan wording for the exact on-time
-  // boundary (17:00) than check-in does. Keep the action prefix in the
-  // internal event and translate the user-visible status here.
+  // Keep the internal event/status enums stable for cloud/database history,
+  // but show only the agreed attendance categories to the user.
   if (e.indexOf("CHECK OUT") >= 0) {
     if (e.indexOf("LEFT EARLY") >= 0) return "Utashe kare";
-    if (e.indexOf("OVERTIME") >= 0) return "GOOD BYE!!!!!";
-    if (e.indexOf("ON TIME") >= 0) return "Utahiye k' ugihe";
+    if (e.indexOf("ON TIME") >= 0 || e.indexOf("OVERTIME") >= 0) return "Utahiye ku gihe";
     return "Wavuye";
   }
 
   if (e.indexOf("CHECK IN") >= 0) {
-    if (e.indexOf("EARLY") >= 0) return "Wazindutse";
-    if (e.indexOf("ON TIME") >= 0) return "Uziye k' ugihe";
+    if (e.indexOf("ON TIME") >= 0) return "Uziye ku gihe";
     if (e.indexOf("LATE") >= 0) return "Wakerewe";
     return "Kwinjiye";
   }
 
-  if (e.indexOf("TIME UNKNOWN") >= 0) return "Mwihangane igihe ntikibonetse";
+  if (e.indexOf("TIME UNKNOWN") >= 0) return "Igihe ntikiboneka";
   return "";
 }
 
@@ -547,9 +544,27 @@ void scanFingerprint() {
         return;
       }
 
-      bool wasInside = false;
-      if (lockState()) { wasInside = insideState[id]; unlockState(); }
-      if (!wasInside) {
+      char scanDate[11] = "";
+      snprintf(scanDate, sizeof(scanDate), "%04d-%02d-%02d",
+               nowTi.tm_year + 1900, nowTi.tm_mon + 1, nowTi.tm_mday);
+      refreshDailyAttendanceStateForDate(scanDate);
+
+      bool checkInDoneToday = false;
+      bool checkOutDoneToday = false;
+      if (lockState(100)) {
+        checkInDoneToday = todayCheckInDone[id];
+        checkOutDoneToday = todayCheckOutDone[id];
+        unlockState();
+      } else {
+        attendanceFailureFeedback();
+        oledErrorAnimation("STATE BUSY", "Try again");
+        beginScanResultHold(600);
+        return;
+      }
+
+      if (!checkInDoneToday) {
+        // A new calendar day always starts with CHECK_IN, even when the previous
+        // day's CHECK_OUT was missed and the persisted insideState is still true.
         String attendanceStatus = getAttendanceStatus(true);
         String attendanceTime = currentDateTimeText();
         bool saved=addLog(attendanceStatus, id, logName + " checked in at " + attendanceTime + " - " + attendanceStatus);
@@ -561,7 +576,7 @@ void scanFingerprint() {
         }
         attendanceSuccessFeedback();
         oledSuccessAnimation(attendanceStatusRwLabel(attendanceStatus), displayName);
-      } else {
+      } else if (!checkOutDoneToday) {
         String attendanceStatus = getAttendanceStatus(false);
         String attendanceTime = currentDateTimeText();
         bool saved=addLog(attendanceStatus, id, logName + " checked out at " + attendanceTime + " - " + attendanceStatus);
@@ -573,6 +588,12 @@ void scanFingerprint() {
         }
         attendanceSuccessFeedback();
         oledSuccessAnimation(attendanceStatusRwLabel(attendanceStatus), displayName);
+      } else {
+        // Both daily events already exist. Do not toggle state or create a
+        // second pair of attendance records for the same teacher/day.
+        oledBig("DONE TODAY", "Attendance complete", displayName);
+        beginScanResultHold(900);
+        return;
       }
     } else {
       addLog("MATCH", id, logName + " matched");
