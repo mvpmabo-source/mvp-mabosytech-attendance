@@ -703,7 +703,7 @@ static void handleCloudCommand(const char* commandId, const char* command, const
     }
     if (isEnrolling || dashboardEnrollRequest || activeCloudEnrollCommandId[0]) {
       Serial.println("[CLOUD OTA] Rejected: fingerprint enrollment is active.");
-      CloudSync.completeCommand(commandId, false, "{\\"ok\\":false,\\"error\\":\\"enrollment_in_progress\\"}");
+      CloudSync.completeCommand(commandId, false, "{\"ok\":false,\"error\":\"enrollment_in_progress\"}");
       CloudSync.flushCommandAcks();
       return;
     }
