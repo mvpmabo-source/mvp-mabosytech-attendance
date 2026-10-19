@@ -30,7 +30,7 @@ static bool validSha256Hex(const char* value) {
 }
 
 static bool validReleaseVersion(const char* value) {
-  if (!value || !value[0] || strlen(value) > 64) return false;
+  if (!value || value[0] != 'V' || strlen(value) > 64) return false;
   for (size_t i = 0; value[i]; ++i) {
     const char c = value[i];
     if (!(isalnum((unsigned char)c) || c == '.' || c == '_' || c == '+' || c == '-')) return false;
