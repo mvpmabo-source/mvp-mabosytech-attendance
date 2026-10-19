@@ -176,10 +176,14 @@ export function OverviewPage() {
           <div className="p-4 text-sm text-rose-700 bg-rose-50">Could not load teacher attendance: {dailyAttendanceError}</div>
         ) : (
           <>
-            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3 p-4 bg-slate-50">
+            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-3 p-4 bg-slate-50">
               <div className="rounded-lg border border-slate-200 bg-white p-4">
                 <div className="flex items-center gap-2 text-slate-500 text-sm"><Users className="w-4 h-4" /> Registered teachers</div>
                 <p className="text-2xl font-semibold text-slate-800 mt-2">{dailyTeachers.length}</p>
+              </div>
+              <div className="rounded-lg border border-teal-200 bg-teal-50 p-4">
+                <div className="flex items-center gap-2 text-teal-700 text-sm"><UserCheck className="w-4 h-4" /> Attended at least once</div>
+                <p className="text-2xl font-semibold text-teal-800 mt-2">{dailyTeachers.filter((teacher) => teacher.dailyStatus !== "absent").length}</p>
               </div>
               <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4">
                 <div className="flex items-center gap-2 text-emerald-700 text-sm"><UserCheck className="w-4 h-4" /> Completed (green)</div>
