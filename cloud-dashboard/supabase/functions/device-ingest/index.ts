@@ -384,7 +384,7 @@ Deno.serve(async (req: Request) => {
             version: release.version,
             storage_path: release.storage_path,
             sha256: release.sha256,
-            size_bytes: Number(release.size_bytes),
+            size_bytes: releaseSize,
             firmware_url: signed.signedUrl,
           },
         };
