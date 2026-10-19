@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS public.firmware_releases (
   sha256 text NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
   size_bytes bigint NOT NULL CHECK (size_bytes > 0 AND size_bytes <= 2097152),
   release_notes text,
-  uploaded_by uuid NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
+  uploaded_by uuid REFERENCES auth.users(id) ON DELETE SET NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
