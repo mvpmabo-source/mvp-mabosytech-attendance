@@ -6,8 +6,8 @@
 // The ESP32 joins the existing office/router Wi-Fi as a STA.
 // The two credential macros live in config.h so they are easy to change
 // without touching the network implementation.
-const char* WIFI_SSID     = "WIFI YAWE";
-const char* WIFI_PASSWORD = "PASSWORD YAWE";
+const char* WIFI_SSID     = WIFI_SSID_VALUE;
+const char* WIFI_PASSWORD = WIFI_PASSWORD_VALUE;
 // Rwanda local time: Central Africa Time, UTC+2, no DST.
 // Kept as POSIX TZ form because the ESP32 time APIs use that representation.
 const char* TIME_ZONE     = "CAT-2";
