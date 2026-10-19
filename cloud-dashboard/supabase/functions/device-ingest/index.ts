@@ -312,10 +312,64 @@ Deno.serve(async (req: Request) => {
         return jsonError(500, "Pending command lookup failed");
       }
 
-      const pendingCommands = [...pendingById.values()]
+      const commandsToDeliver = [...pendingById.values()]
         .sort((a, b) => a.created_at.localeCompare(b.created_at))
-        .slice(0, 5)
-        .map(({ id, command, payload, created_at }) => ({ id, command, payload, created_at }));
+        .slice(0, 5);
+
+      // Firmware files are private. Only this authenticated device receives a
+      // short-lived signed URL, and only when its queued command matches a saved
+      // release version/path. Never expose service-role credentials to the browser.
+      const pendingCommands = await Promise.all(commandsToDeliver.map(async (command) => {
+        if (command.command !== "cloud_ota") return command;
+
+        const payload = command.payload || {};
+        const version = typeof payload.version === "string" ? payload.version : "";
+        const storagePath = typeof payload.storage_path === "string" ? payload.storage_path : "";
+        const safePath = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}\/[A-Za-z0-9._-]+\.bin$/.test(storagePath);
+        if (!version || !safePath) {
+          return { ...command, payload: { ...payload, firmware_url_error: "invalid_release_metadata" } };
+        }
+
+        const { data: release, error: releaseError } = await adminClient
+          .from("firmware_releases")
+          .select("version, storage_path, sha256, size_bytes")
+          .eq("version", version)
+          .eq("storage_path", storagePath)
+          .maybeSingle();
+
+        if (releaseError || !release) {
+          console.warn("Cloud OTA release lookup failed:", releaseError?.message || "release not found");
+          return { ...command, payload: { ...payload, firmware_url_error: "release_metadata_not_found" } };
+        }
+
+        const requestedSha = typeof payload.sha256 === "string" ? payload.sha256.toLowerCase() : "";
+        const requestedSize = Number(payload.size_bytes);
+        if (requestedSha !== release.sha256 || requestedSize !== Number(release.size_bytes)) {
+          console.warn("Cloud OTA queued metadata mismatch for release:", version);
+          return { ...command, payload: { ...payload, firmware_url_error: "release_checksum_or_size_mismatch" } };
+        }
+
+        const { data: signed, error: signedError } = await adminClient
+          .storage
+          .from("firmware-releases")
+          .createSignedUrl(storagePath, 60 * 60);
+
+        if (signedError || !signed?.signedUrl) {
+          console.warn("Could not sign Cloud OTA firmware URL:", signedError?.message || "signed URL missing");
+          return { ...command, payload: { ...payload, firmware_url_error: "signed_url_unavailable" } };
+        }
+
+        return {
+          ...command,
+          payload: {
+            version: release.version,
+            storage_path: release.storage_path,
+            sha256: release.sha256,
+            size_bytes: Number(release.size_bytes),
+            firmware_url: signed.signedUrl,
+          },
+        };
+      }));
 
       console.log(
         `Heartbeat command poll: device_id=${device.device_id} database_id=${device.id} targets=${commandTargets.join(",")} pending=${pendingCommands.length}`
