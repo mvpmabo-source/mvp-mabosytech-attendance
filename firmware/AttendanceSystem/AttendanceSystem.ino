@@ -701,6 +701,12 @@ static void handleCloudCommand(const char* commandId, const char* command, const
       CloudSync.flushCommandAcks();
       return;
     }
+    if (isEnrolling || dashboardEnrollRequest || activeCloudEnrollCommandId[0]) {
+      Serial.println("[CLOUD OTA] Rejected: fingerprint enrollment is active.");
+      CloudSync.completeCommand(commandId, false, "{\\"ok\\":false,\\"error\\":\\"enrollment_in_progress\\"}");
+      CloudSync.flushCommandAcks();
+      return;
+    }
     if (firmwareUrl.length() == 0) {
       Serial.printf("[CLOUD OTA] Firmware URL unavailable: %s\n",
                     urlError.length() ? urlError.c_str() : "missing_signed_url");
