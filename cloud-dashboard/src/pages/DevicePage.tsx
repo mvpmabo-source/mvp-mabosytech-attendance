@@ -70,7 +70,7 @@ export function DevicePage() {
       return;
     }
     const version = firmwareVersion.trim();
-    if (!/^V?[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$/.test(version)) {
+    if (!/^V?[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$/.test(version)) {
       setError("Enter the firmware version exactly as compiled, for example V2.9.46.");
       return;
     }
