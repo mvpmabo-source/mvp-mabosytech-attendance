@@ -1,6 +1,7 @@
 #include "app.h"
 #include <esp_system.h>
 #include "mbedtls/sha256.h"
+#include "cloud_ota.h"
 #include <ArduinoJson.h>
 
 static void handleCloudCommand(const char* commandId, const char* command, const char* payload);
@@ -676,6 +677,57 @@ static void handleCloudCommand(const char* commandId, const char* command, const
     CloudSync.completeCommand(commandId, true, "{\"ok\":true,\"message\":\"restart_scheduled\"}");
     CloudSync.flushCommandAcks();
     requestRestart(false);
+    return;
+  }
+
+
+  if (!strcmp(command, "cloud_ota")) {
+    const String targetVersion = data["version"] | "";
+    const String firmwareUrl = data["firmware_url"] | "";
+    const String expectedSha256 = data["sha256"] | "";
+    const size_t expectedSize = data["size_bytes"] | 0UL;
+    const String urlError = data["firmware_url_error"] | "";
+
+    if (targetVersion.length() == 0 || expectedSha256.length() != 64 || expectedSize == 0) {
+      Serial.printf("[CLOUD OTA] Invalid release metadata (version=%s size=%u sha_len=%u).\\n",
+                    targetVersion.c_str(), (unsigned)expectedSize, (unsigned)expectedSha256.length());
+      CloudSync.completeCommand(commandId, false, "{\\"ok\\":false,\\"error\\":\\"invalid_firmware_release_metadata\\"}");
+      CloudSync.flushCommandAcks();
+      return;
+    }
+    if (targetVersion == FIRMWARE_VERSION) {
+      Serial.printf("[CLOUD OTA] %s is already installed; skipping download.\\n", targetVersion.c_str());
+      CloudSync.completeCommand(commandId, true, "{\\"ok\\":true,\\"message\\":\\"already_on_target_version\\"}");
+      CloudSync.flushCommandAcks();
+      return;
+    }
+    if (firmwareUrl.length() == 0) {
+      Serial.printf("[CLOUD OTA] Firmware URL unavailable: %s\\n",
+                    urlError.length() ? urlError.c_str() : "missing_signed_url");
+      oledErrorAnimation("OTA FAILED", "Release URL unavailable");
+      CloudSync.completeCommand(commandId, false, "{\\"ok\\":false,\\"error\\":\\"firmware_download_url_unavailable\\"}");
+      CloudSync.flushCommandAcks();
+      return;
+    }
+
+    const bool updated = performCloudFirmwareUpdate(
+      targetVersion.c_str(), firmwareUrl.c_str(),
+      expectedSha256.c_str(), expectedSize);
+
+    if (updated) {
+      Serial.printf("[CLOUD OTA] Update to %s verified and staged; acknowledgement follows.\\n",
+                    targetVersion.c_str());
+      CloudSync.completeCommand(commandId, true, "{\\"ok\\":true,\\"message\\":\\"firmware_verified_restart_scheduled\\"}");
+      CloudSync.flushCommandAcks();
+      delay(700);
+      Serial.println("[CLOUD OTA] Restarting into the new firmware...");
+      ESP.restart();
+      return;
+    }
+
+    CloudSync.completeCommand(commandId, false, "{\\"ok\\":false,\\"error\\":\\"firmware_download_or_verification_failed\\"}");
+    CloudSync.flushCommandAcks();
+    oledErrorAnimation("OTA FAILED", "Old firmware kept");
     return;
   }
 
