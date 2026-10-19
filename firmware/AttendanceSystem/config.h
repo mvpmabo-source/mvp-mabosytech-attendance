@@ -68,7 +68,7 @@
 #define FP_SLEEP_PROBE_MS 400UL
 #define FP_PROBE_EXPOSURE_MS 60UL
 #define FP_TOUCH_STUCK_MS 30000UL
-#define FIRMWARE_VERSION "V2.9.46"
+#define FIRMWARE_VERSION "V2.9.47"
 
 // =====================================================
 // CLOUD SYNC CONFIGURATION
