@@ -63,24 +63,21 @@ static String attendanceStatusRwLabel(const String &event) {
   String e = event;
   e.toUpperCase();
 
-  // Check-out has a different Rwandan wording for the exact on-time
-  // boundary (17:00) than check-in does. Keep the action prefix in the
-  // internal event and translate the user-visible status here.
+  // Keep the internal event/status enums stable for cloud/database history,
+  // but show only the agreed attendance categories to the user.
   if (e.indexOf("CHECK OUT") >= 0) {
     if (e.indexOf("LEFT EARLY") >= 0) return "Utashe kare";
-    if (e.indexOf("OVERTIME") >= 0) return "GOOD BYE!!!!!";
-    if (e.indexOf("ON TIME") >= 0) return "Utahiye k' ugihe";
+    if (e.indexOf("ON TIME") >= 0 || e.indexOf("OVERTIME") >= 0) return "Utahiye ku gihe";
     return "Wavuye";
   }
 
   if (e.indexOf("CHECK IN") >= 0) {
-    if (e.indexOf("EARLY") >= 0) return "Wazindutse";
-    if (e.indexOf("ON TIME") >= 0) return "Uziye k' ugihe";
+    if (e.indexOf("ON TIME") >= 0) return "Uziye ku gihe";
     if (e.indexOf("LATE") >= 0) return "Wakerewe";
     return "Kwinjiye";
   }
 
-  if (e.indexOf("TIME UNKNOWN") >= 0) return "Mwihangane igihe ntikibonetse";
+  if (e.indexOf("TIME UNKNOWN") >= 0) return "Igihe ntikiboneka";
   return "";
 }
 
