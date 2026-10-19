@@ -69,8 +69,9 @@ bool performCloudFirmwareUpdate(
 
   const String url = String(firmwareUrl);
   const String allowedPrefix = cloudOtaSignedUrlPrefix();
-  if (!allowedPrefix.length() || !url.startsWith(allowedPrefix) ||
-      url.indexOf('\r') >= 0 || url.indexOf('\n') >= 0 || url.indexOf('#') >= 0) {
+  if (!allowedPrefix.startsWith("https://") || !url.startsWith("https://") ||
+      !url.startsWith(allowedPrefix) || url.indexOf('\r') >= 0 ||
+      url.indexOf('\n') >= 0 || url.indexOf('#') >= 0) {
     Serial.println("[CLOUD OTA] Rejected URL outside the trusted Supabase Storage bucket.");
     return false;
   }
