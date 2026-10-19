@@ -330,9 +330,12 @@ Deno.serve(async (req: Request) => {
           return { ...command, payload: { ...payload, firmware_url_error: "invalid_release_metadata" } };
         }
 
+        // Bolt's existing database may use file_size, while migration 003
+        // originally named this field size_bytes. Read the row first and
+        // normalize either schema to the exact payload required by ESP32.
         const { data: release, error: releaseError } = await adminClient
           .from("firmware_releases")
-          .select("version, storage_path, sha256, size_bytes")
+          .select("*")
           .eq("version", version)
           .eq("storage_path", storagePath)
           .maybeSingle();
@@ -342,9 +345,25 @@ Deno.serve(async (req: Request) => {
           return { ...command, payload: { ...payload, firmware_url_error: "release_metadata_not_found" } };
         }
 
+        const releaseSha = typeof release.sha256 === "string" ? release.sha256.toLowerCase() : "";
+        const releaseSize = Number(release.size_bytes ?? release.file_size);
         const requestedSha = typeof payload.sha256 === "string" ? payload.sha256.toLowerCase() : "";
-        const requestedSize = Number(payload.size_bytes);
-        if (requestedSha !== release.sha256 || requestedSize !== Number(release.size_bytes)) {
+        const requestedSizeRaw = payload.size_bytes ?? payload.file_size;
+        const requestedSize = requestedSizeRaw === undefined || requestedSizeRaw === null || requestedSizeRaw === ""
+          ? null
+          : Number(requestedSizeRaw);
+
+        // The saved release row is authoritative. Legacy queued commands may
+        // carry file_size or omit size entirely; when present, queued values
+        // still must match the canonical release metadata.
+        if (
+          !/^[0-9a-f]{64}$/.test(releaseSha) ||
+          requestedSha !== releaseSha ||
+          !Number.isSafeInteger(releaseSize) ||
+          releaseSize <= 0 ||
+          (requestedSize !== null &&
+            (!Number.isSafeInteger(requestedSize) || requestedSize !== releaseSize))
+        ) {
           console.warn("Cloud OTA queued metadata mismatch for release:", version);
           return { ...command, payload: { ...payload, firmware_url_error: "release_checksum_or_size_mismatch" } };
         }
