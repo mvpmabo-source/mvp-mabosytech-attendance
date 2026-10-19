@@ -261,6 +261,9 @@ String cachedRegisteredJson = "[]";
 uint16_t scanFirstFreeId = 1;
 int entryCount = 0, exitCount = 0, lastEntryId = -1, tickLastRamDroppedSeen = -1;
 bool insideState[MAX_FINGERPRINTS + 1];
+bool todayCheckInDone[MAX_FINGERPRINTS + 1] = {};
+bool todayCheckOutDone[MAX_FINGERPRINTS + 1] = {};
+char attendanceBusinessDate[11] = ""; // YYYY-MM-DD; flags are rebuilt from SD history at boot
 // Section 6 (duplicate protection): last time each fingerprint ID produced
 // an attendance record, used to debounce accidental repeated scans.
 unsigned long lastAttendanceActionMs[MAX_FINGERPRINTS + 1];
