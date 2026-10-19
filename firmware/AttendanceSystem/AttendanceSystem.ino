@@ -761,13 +761,13 @@ static void handleCloudCommand(const char* commandId, const char* command, const
       expectedSha256.c_str(), expectedSize);
 
     if (updated) {
-      Serial.printf("[CLOUD OTA] Update to %s verified and staged; restart waits for ACK.\\n",
+      Serial.printf("[CLOUD OTA] Update to %s verified and staged; restart waits for ACK.\n",
                     targetVersion.c_str());
       strncpy(cloudRestartCommandId, commandId, sizeof(cloudRestartCommandId)-1);
-      cloudRestartCommandId[sizeof(cloudRestartCommandId)-1] = '\\0';
+      cloudRestartCommandId[sizeof(cloudRestartCommandId)-1] = '\0';
       cloudRestartAfterAck = true;
       cloudRestartFallbackAtMs = millis() + CLOUD_TIMEOUT_MS + 1000UL;
-      CloudSync.completeCommand(commandId, true, "{\\"ok\\":true,\\"message\\":\\"firmware_verified_restart_scheduled\\"}");
+      CloudSync.completeCommand(commandId, true, "{\"ok\":true,\"message\":\"firmware_verified_restart_scheduled\"}");
       CloudSync.flushCommandAcks();
       Serial.println("[CLOUD OTA] ACK queued; attendance loop remains active while the cloud worker sends it.");
       return;
