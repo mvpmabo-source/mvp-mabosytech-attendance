@@ -185,7 +185,9 @@ bool CloudSyncClass::beginExclusiveNetworkOperation(uint32_t timeoutMs) {
     Serial.println("[CLOUD] Exclusive TLS slot busy; refusing OTA start so attendance/network state is not corrupted.");
     return false;
   }
-  Serial.println("[CLOUD] Exclusive TLS slot acquired for Cloud OTA.");
+  // Release the idle keep-alive session before OTA allocates its own TLS client.
+  _tls.stop();
+  Serial.println("[CLOUD] Exclusive TLS slot acquired for Cloud OTA; idle cloud TLS session released.");
   return true;
 }
 
