@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { Cpu, Wifi, HardDrive, Clock, Fingerprint, RotateCw, CalendarClock, CheckCircle2, XCircle, AlertTriangle, RefreshCw } from "lucide-react";
-import { supabase, type DeviceHeartbeat, type DeviceCommand, type Device } from "@/lib/supabase";
+import { Cpu, Wifi, HardDrive, Clock, Fingerprint, RotateCw, CheckCircle2, XCircle, AlertTriangle, RefreshCw, Upload, Rocket, ShieldCheck, FileCheck2 } from "lucide-react";
+import { supabase, type DeviceHeartbeat, type DeviceCommand, type Device, type FirmwareRelease } from "@/lib/supabase";
 import { Card, LoadingSpinner, EmptyState, ErrorState, Badge, timeAgo, isStale } from "@/components/ui";
 import { useAuth } from "@/context/AuthContext";
 
@@ -12,19 +12,32 @@ export function DevicePage() {
   const [device, setDevice] = useState<Device | null>(null);
   const [commands, setCommands] = useState<DeviceCommand[]>([]);
   const [sendingCmd, setSendingCmd] = useState(false);
+  const [releases, setReleases] = useState<FirmwareRelease[]>([]);
+  const [firmwareFile, setFirmwareFile] = useState<File | null>(null);
+  const [firmwareVersion, setFirmwareVersion] = useState("");
+  const [releaseNotes, setReleaseNotes] = useState("");
+  const [uploadingFirmware, setUploadingFirmware] = useState(false);
+  const [deployingVersion, setDeployingVersion] = useState<string | null>(null);
+  const [firmwareMessage, setFirmwareMessage] = useState<string | null>(null);
 
   async function load() {
     try {
-      const [hbRes, devRes, cmdRes] = await Promise.all([
+      const [hbRes, devRes, cmdRes, releaseRes] = await Promise.all([
         supabase.from("device_heartbeats").select("*").order("received_at", { ascending: false }).limit(1).maybeSingle(),
         supabase.from("devices").select("*").order("created_at", { ascending: false }).limit(1).maybeSingle(),
         supabase.from("device_commands").select("*").order("created_at", { ascending: false }).limit(20),
+        supabase.from("firmware_releases").select("*").order("created_at", { ascending: false }).limit(8),
       ]);
       if (hbRes.error) throw new Error(hbRes.error.message);
       if (devRes.error) throw new Error(devRes.error.message);
       setHeartbeat((hbRes.data as DeviceHeartbeat) ?? null);
       setDevice((devRes.data as Device) ?? null);
       setCommands((cmdRes.data as DeviceCommand[]) ?? []);
+      if (releaseRes.error) {
+        setFirmwareMessage(`Cloud OTA is not configured yet: ${releaseRes.error.message}`);
+      } else {
+        setReleases((releaseRes.data as FirmwareRelease[]) ?? []);
+      }
     } catch (err) { setError(err instanceof Error ? err.message : "Failed to load device data"); } finally { setLoading(false); }
   }
 
@@ -50,6 +63,99 @@ export function DevicePage() {
       await load();
     } catch (err) { setError(err instanceof Error ? err.message : "Failed to send command"); } finally { setSendingCmd(false); }
   };
+
+  async function uploadFirmwareRelease() {
+    if (!firmwareFile) {
+      setError("Choose an ESP32 .bin firmware file first.");
+      return;
+    }
+    const version = firmwareVersion.trim();
+    if (!/^V?[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$/.test(version)) {
+      setError("Enter the firmware version exactly as compiled, for example V2.9.46.");
+      return;
+    }
+    if (!firmwareFile.name.toLowerCase().endsWith(".bin")) {
+      setError("Only compiled .bin firmware files are accepted.");
+      return;
+    }
+    if (firmwareFile.size <= 0 || firmwareFile.size > 2 * 1024 * 1024) {
+      setError("Firmware file must be between 1 byte and 2 MiB; the device will also check its OTA partition size.");
+      return;
+    }
+
+    setUploadingFirmware(true);
+    setError(null);
+    setFirmwareMessage(null);
+    try {
+      const digestBuffer = await crypto.subtle.digest("SHA-256", await firmwareFile.arrayBuffer());
+      const sha256 = Array.from(new Uint8Array(digestBuffer))
+        .map((value) => value.toString(16).padStart(2, "0")).join("");
+      const safeFileName = firmwareFile.name.replace(/[^A-Za-z0-9._-]/g, "_");
+      const storagePath = `${version}/${crypto.randomUUID()}-${safeFileName}`;
+
+      const { error: uploadError } = await supabase.storage.from("firmware-releases").upload(storagePath, firmwareFile, {
+        contentType: "application/octet-stream",
+        upsert: false,
+      });
+      if (uploadError) throw new Error(`Firmware upload failed: ${uploadError.message}`);
+
+      const { error: metadataError } = await supabase.from("firmware_releases").insert({
+        version,
+        storage_path: storagePath,
+        sha256,
+        size_bytes: firmwareFile.size,
+        release_notes: releaseNotes.trim() || null,
+        uploaded_by: user?.id ?? null,
+      });
+      if (metadataError) throw new Error(`Firmware uploaded, but release metadata could not be saved: ${metadataError.message}`);
+
+      setFirmwareMessage(`Firmware ${version} uploaded. SHA-256: ${sha256}. Uploading alone does not flash the device.`);
+      setFirmwareFile(null);
+      setFirmwareVersion("");
+      setReleaseNotes("");
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Firmware upload failed.");
+    } finally {
+      setUploadingFirmware(false);
+    }
+  }
+
+  async function deployFirmwareRelease(release: FirmwareRelease) {
+    if (!device?.device_id && !heartbeat?.device_id) {
+      setError("No registered device ID is available.");
+      return;
+    }
+    const confirmed = window.confirm(
+      `Send firmware ${release.version} to the ESP32? Attendance scanning pauses during download and verification, then the device restarts.`
+    );
+    if (!confirmed) return;
+
+    setDeployingVersion(release.version);
+    setError(null);
+    setFirmwareMessage(null);
+    try {
+      const { error: commandError } = await supabase.from("device_commands").insert({
+        device_id: device?.device_id ?? heartbeat?.device_id,
+        command: "cloud_ota",
+        payload: {
+          version: release.version,
+          storage_path: release.storage_path,
+          sha256: release.sha256,
+          size_bytes: release.size_bytes,
+        },
+        status: "pending",
+        created_by: user?.id ?? null,
+      });
+      if (commandError) throw new Error(commandError.message);
+      setFirmwareMessage(`OTA command for ${release.version} queued. The ESP32 will receive a short-lived signed HTTPS download link at its next cloud heartbeat. Check Serial Monitor/OLED and command history for progress.`);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not queue the cloud OTA command.");
+    } finally {
+      setDeployingVersion(null);
+    }
+  }
 
   if (loading) return <LoadingSpinner label="Loading device status..." />;
   const deviceOnline = heartbeat?.wifi_connected && !isStale(heartbeat?.received_at ?? null);
@@ -82,6 +188,61 @@ export function DevicePage() {
         )}
       </Card>
       {!heartbeat && !error && <Card><EmptyState icon={<Cpu className="w-7 h-7" />} title="No device connected yet" description="Once your ESP32 is configured with cloud credentials and uploads a heartbeat, its full status will appear here." /></Card>}
+      <Card className="p-6">
+        <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
+          <div>
+            <h3 className="text-base font-semibold text-slate-800 flex items-center gap-2"><Upload className="w-5 h-5 text-slate-500" /> Cloud Firmware OTA</h3>
+            <p className="text-sm text-slate-500 mt-1">Upload a compiled ESP32 .bin, verify its SHA-256, then queue a cloud update.</p>
+          </div>
+          <span className="inline-flex items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2.5 py-1 text-xs font-medium text-sky-700"><ShieldCheck className="w-3.5 h-3.5" /> HTTPS + SHA-256</span>
+        </div>
+        {firmwareMessage && <div className="rounded-lg border border-sky-200 bg-sky-50 p-3 text-sm text-sky-800 mb-4 break-words">{firmwareMessage}</div>}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <label className="block text-sm font-medium text-slate-700">Firmware version
+            <input value={firmwareVersion} onChange={(event) => setFirmwareVersion(event.target.value)} placeholder="V2.9.46" className="mt-1 block w-full rounded-lg border border-slate-200 px-3 py-2 text-sm outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-100" />
+            <span className="mt-1 block text-xs font-normal text-slate-400">Must match FIRMWARE_VERSION compiled into the uploaded binary.</span>
+          </label>
+          <label className="block text-sm font-medium text-slate-700">Firmware .bin file
+            <input type="file" accept=".bin,application/octet-stream" onChange={(event) => setFirmwareFile(event.target.files?.[0] ?? null)} className="mt-1 block w-full rounded-lg border border-slate-200 px-3 py-2 text-sm file:mr-3 file:rounded file:border-0 file:bg-slate-100 file:px-3 file:py-1.5 file:text-xs" />
+            <span className="mt-1 block text-xs font-normal text-slate-400">{firmwareFile ? `${firmwareFile.name} · ${(firmwareFile.size / 1024).toFixed(0)} KB` : "Maximum 2 MiB. Build with your private secrets_local.h."}</span>
+          </label>
+        </div>
+        <label className="block text-sm font-medium text-slate-700 mt-3">Release notes (optional)
+          <textarea value={releaseNotes} onChange={(event) => setReleaseNotes(event.target.value)} rows={2} maxLength={500} placeholder="What changed in this firmware?" className="mt-1 block w-full rounded-lg border border-slate-200 px-3 py-2 text-sm outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-100" />
+        </label>
+        <div className="flex flex-wrap items-center gap-3 mt-4">
+          <button onClick={uploadFirmwareRelease} disabled={uploadingFirmware || !firmwareFile || !firmwareVersion.trim()} className="inline-flex items-center gap-2 rounded-lg bg-slate-800 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50">
+            <Upload className="w-4 h-4" />{uploadingFirmware ? "Uploading…" : "Upload release"}
+          </button>
+          <p className="text-xs text-slate-500">Uploading stores a private release; it does not flash the device.</p>
+        </div>
+      </Card>
+
+      <Card className="overflow-hidden">
+        <div className="px-5 py-3 border-b border-slate-200 flex items-center justify-between gap-3">
+          <div><h3 className="text-sm font-semibold text-slate-800">Available Firmware Releases</h3><p className="text-xs text-slate-500 mt-1">Select a release to queue it for the ESP32.</p></div>
+          <FileCheck2 className="w-5 h-5 text-slate-400" />
+        </div>
+        {releases.length === 0 ? (
+          <div className="p-5 text-sm text-slate-500">No firmware releases uploaded yet, or the cloud OTA migration still needs to be applied.</div>
+        ) : (
+          <div className="divide-y divide-slate-100">
+            {releases.map((release) => (
+              <div key={release.id} className="p-4 flex flex-col md:flex-row md:items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="font-medium text-slate-800">{release.version} <span className="ml-2 text-xs text-slate-500 font-normal">{(release.size_bytes / 1024).toFixed(0)} KB · {timeAgo(release.created_at)}</span></p>
+                  {release.release_notes && <p className="text-sm text-slate-600 mt-1">{release.release_notes}</p>}
+                  <p className="text-xs font-mono text-slate-400 mt-1 break-all">SHA-256: {release.sha256}</p>
+                </div>
+                <button onClick={() => deployFirmwareRelease(release)} disabled={deployingVersion !== null || release.version === heartbeat?.firmware_version} className="shrink-0 inline-flex items-center justify-center gap-2 rounded-lg border border-sky-200 px-3 py-2 text-sm font-medium text-sky-700 hover:bg-sky-50 disabled:opacity-50">
+                  <Rocket className="w-4 h-4" />{deployingVersion === release.version ? "Queueing…" : release.version === heartbeat?.firmware_version ? "Already installed" : "Send to ESP32"}
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
       {heartbeat && (
         <>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
