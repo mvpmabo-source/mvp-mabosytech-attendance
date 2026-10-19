@@ -210,6 +210,7 @@ export function DevicePage() {
           </div>
           <span className="inline-flex items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2.5 py-1 text-xs font-medium text-sky-700"><ShieldCheck className="w-3.5 h-3.5" /> HTTPS + SHA-256</span>
         </div>
+        <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800 mb-4"><strong>One-time setup:</strong> The ESP32 must first be flashed once with Cloud OTA-enabled firmware (V2.9.46 or later) using the existing LAN ArduinoOTA uploader or USB. After that, compatible releases can be sent from this dashboard. Attendance pauses while an update downloads and verifies.</div>
         {firmwareMessage && <div className="rounded-lg border border-sky-200 bg-sky-50 p-3 text-sm text-sky-800 mb-4 break-words">{firmwareMessage}</div>}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <label className="block text-sm font-medium text-slate-700">Firmware version
